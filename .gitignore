@@ -1,0 +1,7 @@
+/build*/
+/out/
+old/
+imgui.ini
+.cache/
+*.exe
+*.pdb
