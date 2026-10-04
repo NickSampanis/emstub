@@ -1,4 +1,3 @@
-/* emstub core. See include/emstub/stub.h for how an embedder drives it. */
 #include "emstub/stub.h"
 
 EM_STATIC_ASSERT(EM_STUB_MAX_PAYLOAD >= EM_MIN_PAYLOAD, "EM_STUB_MAX_PAYLOAD too small");
@@ -6,108 +5,103 @@ EM_STATIC_ASSERT(EM_STUB_MAX_PAYLOAD >= sizeof(em_stopped) + 3 * sizeof(em_rb_hd
                  sizeof(em_x86_core) + sizeof(em_x86_segs) + sizeof(em_x86_ctrl),
                  "STOPPED event must fit in one payload");
 
-#define TX_PAYLOAD(s)  ((s)->tx + sizeof(em_hdr))
-#define RX_PAYLOAD(s)  ((s)->rx + sizeof(em_hdr))
+#define TX_PAYLOAD(stub)  ((stub)->tx + sizeof(em_hdr))
+#define RX_PAYLOAD(stub)  ((stub)->rx + sizeof(em_hdr))
 
-/* --- freestanding helpers ------------------------------------------------------------ */
-
-static void em_memcpy(void *dst, const void *src, uint32_t n)
+static void em_memcpy(void *dst, const void *src, uint32_t count)
 {
-    uint8_t       *d = (uint8_t *)dst;
-    const uint8_t *p = (const uint8_t *)src;
+    uint8_t              *dst_bytes;
+    const uint8_t        *src_bytes;
 
-    while (n--)
-        *d++ = *p++;
+    dst_bytes = (uint8_t *)dst;
+    src_bytes = (const uint8_t *)src;
+    while (count--)
+        *dst_bytes++ = *src_bytes++;
 }
 
-static void em_memset(void *dst, uint8_t c, uint32_t n)
+static void em_memset(void *dst, uint8_t value, uint32_t count)
 {
-    uint8_t *d = (uint8_t *)dst;
+    uint8_t              *dst_bytes;
 
-    while (n--)
-        *d++ = c;
+    dst_bytes = (uint8_t *)dst;
+    while (count--)
+        *dst_bytes++ = value;
 }
 
-static uint32_t em_min(uint32_t a, uint32_t b)
+static uint32_t em_min(uint32_t first, uint32_t second)
 {
-    return a < b ? a : b;
+    return first < second ? first : second;
 }
 
-/* --- framing ------------------------------------------------------------------------- */
-
-static void drop_connection(em_stub *s)
+static void drop_connection(em_stub *stub)
 {
-    s->connected = 0;
-    s->rx_have = 0;
+    stub->connected = 0;
+    stub->rx_have = 0;
 }
 
-/* Room for a reply / event payload: our buffer, limited by what the debugger accepts. */
-static uint32_t tx_cap(const em_stub *s)
+static uint32_t tx_cap(const em_stub *stub)
 {
-    return em_min(EM_STUB_MAX_PAYLOAD, s->peer_max);
+    return em_min(EM_STUB_MAX_PAYLOAD, stub->peer_max);
 }
 
-/* Send TX_PAYLOAD(s)[0..len) with a header in front. */
-static int send_packet(em_stub *s, uint16_t type, em_kind kind, em_status status, uint32_t seq,
+static int send_packet(em_stub *stub, uint16_t type, em_kind kind, em_status status, uint32_t seq,
                        uint32_t len)
 {
-    em_hdr h;
+    em_hdr               header;
 
-    h.magic  = EM_MAGIC;
-    h.type   = type;
-    h.kind   = (uint8_t)kind;
-    h.status = (uint8_t)status;
-    h.seq    = seq;
-    h.len    = len;
-    h.crc    = len ? em_crc32(0, TX_PAYLOAD(s), len) : 0;
-    em_memcpy(s->tx, &h, sizeof h);
+    header.magic  = EM_MAGIC;
+    header.type   = type;
+    header.kind   = (uint8_t)kind;
+    header.status = (uint8_t)status;
+    header.seq    = seq;
+    header.len    = len;
+    header.crc    = len ? em_crc32(0, TX_PAYLOAD(stub), len) : 0;
+    em_memcpy(stub->tx, &header, sizeof header);
 
-    if (s->ops->send(s->user, s->tx, (uint32_t)sizeof h + len) < 0) {
-        drop_connection(s);
+    if (stub->ops->send(stub->user, stub->tx, (uint32_t)sizeof header + len) < 0) {
+        drop_connection(stub);
         return -1;
     }
     return 0;
 }
 
-/* Accumulate one request in s->rx. Returns 1 when a complete, valid request is there,
- * 0 when more bytes are needed (non-blocking only), -1 when the connection was dropped. */
-static int recv_packet(em_stub *s, int block)
+static int recv_packet(em_stub *stub, int block)
 {
-    em_hdr   h;
-    uint32_t need;
-    int32_t  n;
+    em_hdr               header;
+    uint32_t             needed;
+    int32_t              received;
 
     for (;;) {
-        need = (uint32_t)sizeof h;
-        if (s->rx_have >= sizeof h) {
-            em_memcpy(&h, s->rx, sizeof h);
-            if (h.magic != EM_MAGIC || h.kind != EM_KIND_REQ || h.len > EM_STUB_MAX_PAYLOAD) {
-                drop_connection(s);   /* no way to resync a byte stream */
+        needed = (uint32_t)sizeof header;
+        if (stub->rx_have >= sizeof header) {
+            em_memcpy(&header, stub->rx, sizeof header);
+            if (header.magic != EM_MAGIC || header.kind != EM_KIND_REQ ||
+                header.len > EM_STUB_MAX_PAYLOAD) {
+                drop_connection(stub);
                 return -1;
             }
-            need += h.len;
-            if (s->rx_have == need) {
-                s->rx_have = 0;
-                if (h.len && em_crc32(0, RX_PAYLOAD(s), h.len) != h.crc) {
-                    drop_connection(s);
+            needed += header.len;
+            if (stub->rx_have == needed) {
+                stub->rx_have = 0;
+                if (header.len && em_crc32(0, RX_PAYLOAD(stub), header.len) != header.crc) {
+                    drop_connection(stub);
                     return -1;
                 }
                 return 1;
             }
         }
 
-        n = s->ops->recv(s->user, s->rx + s->rx_have, need - s->rx_have, block);
-        if (n < 0) {
-            drop_connection(s);
+        received = stub->ops->recv(stub->user, stub->rx + stub->rx_have, needed - stub->rx_have,
+                                   block);
+        if (received < 0) {
+            drop_connection(stub);
             return -1;
         }
-        if (n == 0 && !block)
+        if (received == 0 && !block)
             return 0;
-        s->rx_have += (uint32_t)n;
+        stub->rx_have += (uint32_t)received;
     }
 }
-
-/* --- x86 page walker (used when the embedder has no translate / read_virt) ----------- */
 
 #define X86_CR0_PG    (1ull << 31)
 #define X86_CR4_PSE   (1ull << 4)
@@ -119,638 +113,648 @@ static int recv_packet(em_stub *s, int block)
 #define X86_PTE_PS    (1ull << 7)
 #define X86_PTE_NX    (1ull << 63)
 
-/* 4-level long mode, 3-level PAE and 2-level legacy paging, with large pages.
- * 5-level paging (LA57) is not handled yet. */
-static em_status walk_x86(em_stub *s, uint16_t cpu, uint64_t va, uint64_t *pa, uint32_t *flags)
+static em_status walk_x86(em_stub *stub, uint16_t cpu, uint64_t va, uint64_t *pa, uint32_t *flags)
 {
-    static const uint8_t long_shift[] = { 39, 30, 21, 12 };
-    static const uint8_t long_bits[]  = { 9, 9, 9, 9 };
-    static const uint8_t pae_shift[]  = { 30, 21, 12 };
-    static const uint8_t pae_bits[]   = { 2, 9, 9 };
-    static const uint8_t leg_shift[]  = { 22, 12 };
-    static const uint8_t leg_bits[]   = { 10, 10 };
-    const uint8_t *shift;
-    const uint8_t *bits;
-    em_x86_ctrl    ctrl;
-    uint64_t       table, entry, mask, idx, page;
-    uint32_t       esize, entry32, f;
-    int            levels, i, large;
+    static const uint8_t long_shift[]   = { 39, 30, 21, 12 };
+    static const uint8_t long_bits[]    = { 9, 9, 9, 9 };
+    static const uint8_t pae_shift[]    = { 30, 21, 12 };
+    static const uint8_t pae_bits[]     = { 2, 9, 9 };
+    static const uint8_t legacy_shift[] = { 22, 12 };
+    static const uint8_t legacy_bits[]  = { 10, 10 };
+    const uint8_t        *level_shift;
+    const uint8_t        *level_bits;
+    em_x86_ctrl          ctrl_regs;
+    uint64_t             table;
+    uint64_t             entry;
+    uint64_t             addr_mask;
+    uint64_t             table_index;
+    uint64_t             page_size;
+    uint32_t             entry_size;
+    uint32_t             entry32;
+    uint32_t             xlate_flags;
+    int                  level_count;
+    int                  level;
+    int                  is_large;
 
-    if (s->ops->get_regs(s->user, cpu, EM_RB_X86_CTRL, &ctrl, sizeof ctrl) != (int32_t)sizeof ctrl)
+    if (stub->ops->get_regs(stub->user, cpu, EM_RB_X86_CTRL, &ctrl_regs, sizeof ctrl_regs) !=
+        (int32_t)sizeof ctrl_regs)
         return EM_E_UNSUPPORTED;
 
-    f = EM_XLATE_WRITABLE | EM_XLATE_USER;
-    if (!(ctrl.cr0 & X86_CR0_PG)) {
+    xlate_flags = EM_XLATE_WRITABLE | EM_XLATE_USER;
+    if (!(ctrl_regs.cr0 & X86_CR0_PG)) {
         *pa = va;
-        *flags = f;
+        *flags = xlate_flags;
         return EM_OK;
     }
 
-    if (ctrl.efer & X86_EFER_LMA) {
-        shift = long_shift;
-        bits = long_bits;
-        levels = 4;
-        esize = 8;
-        mask = 0x000FFFFFFFFFF000ull;
-        table = ctrl.cr3 & mask;
-    } else if (ctrl.cr4 & X86_CR4_PAE) {
-        shift = pae_shift;
-        bits = pae_bits;
-        levels = 3;
-        esize = 8;
-        mask = 0x000FFFFFFFFFF000ull;
-        table = ctrl.cr3 & 0xFFFFFFE0ull;
+    if (ctrl_regs.efer & X86_EFER_LMA) {
+        level_shift = long_shift;
+        level_bits = long_bits;
+        level_count = 4;
+        entry_size = 8;
+        addr_mask = 0x000FFFFFFFFFF000ull;
+        table = ctrl_regs.cr3 & addr_mask;
+    } else if (ctrl_regs.cr4 & X86_CR4_PAE) {
+        level_shift = pae_shift;
+        level_bits = pae_bits;
+        level_count = 3;
+        entry_size = 8;
+        addr_mask = 0x000FFFFFFFFFF000ull;
+        table = ctrl_regs.cr3 & 0xFFFFFFE0ull;
         va &= 0xFFFFFFFFull;
     } else {
-        shift = leg_shift;
-        bits = leg_bits;
-        levels = 2;
-        esize = 4;
-        mask = 0xFFFFF000ull;
-        table = ctrl.cr3 & mask;
+        level_shift = legacy_shift;
+        level_bits = legacy_bits;
+        level_count = 2;
+        entry_size = 4;
+        addr_mask = 0xFFFFF000ull;
+        table = ctrl_regs.cr3 & addr_mask;
         va &= 0xFFFFFFFFull;
     }
 
-    for (i = 0; i < levels; i++) {
-        idx = (va >> shift[i]) & ((1ull << bits[i]) - 1);
+    for (level = 0; level < level_count; level++) {
+        table_index = (va >> level_shift[level]) & ((1ull << level_bits[level]) - 1);
         entry = 0;
-        if (esize == 8) {
-            if (s->ops->read_phys(s->user, table + idx * 8, &entry, 8) != 8)
+        if (entry_size == 8) {
+            if (stub->ops->read_phys(stub->user, cpu, table + table_index * 8, &entry, 8) != 8)
                 return EM_E_FAULT;
         } else {
             entry32 = 0;
-            if (s->ops->read_phys(s->user, table + idx * 4, &entry32, 4) != 4)
+            if (stub->ops->read_phys(stub->user, cpu, table + table_index * 4, &entry32, 4) != 4)
                 return EM_E_FAULT;
             entry = entry32;
         }
         if (!(entry & X86_PTE_P))
             return EM_E_FAULT;
 
-        /* PAE PDPT entries have no RW/US/NX bits. */
-        if (!(levels == 3 && i == 0)) {
+        if (!(level_count == 3 && level == 0)) {
             if (!(entry & X86_PTE_RW))
-                f &= ~EM_XLATE_WRITABLE;
+                xlate_flags &= ~EM_XLATE_WRITABLE;
             if (!(entry & X86_PTE_US))
-                f &= ~EM_XLATE_USER;
-            if (esize == 8 && (entry & X86_PTE_NX))
-                f |= EM_XLATE_NX;
+                xlate_flags &= ~EM_XLATE_USER;
+            if (entry_size == 8 && (entry & X86_PTE_NX))
+                xlate_flags |= EM_XLATE_NX;
         }
 
-        large = i < levels - 1 && (entry & X86_PTE_PS) &&
-                ((levels == 4 && i >= 1) || (levels == 3 && i == 1) ||
-                 (levels == 2 && (ctrl.cr4 & X86_CR4_PSE)));
-        if (large) {
-            page = 1ull << shift[i];
-            *pa = (entry & mask & ~(page - 1)) + (va & (page - 1));
-            *flags = f | (shift[i] == 30 ? EM_XLATE_HUGE : EM_XLATE_LARGE);
+        is_large = level < level_count - 1 && (entry & X86_PTE_PS) &&
+                   ((level_count == 4 && level >= 1) || (level_count == 3 && level == 1) ||
+                    (level_count == 2 && (ctrl_regs.cr4 & X86_CR4_PSE)));
+        if (is_large) {
+            page_size = 1ull << level_shift[level];
+            *pa = (entry & addr_mask & ~(page_size - 1)) + (va & (page_size - 1));
+            *flags = xlate_flags | (level_shift[level] == 30 ? EM_XLATE_HUGE : EM_XLATE_LARGE);
             return EM_OK;
         }
-        table = entry & mask;
+        table = entry & addr_mask;
     }
 
     *pa = table + (va & 0xFFFu);
-    *flags = f;
+    *flags = xlate_flags;
     return EM_OK;
 }
 
-static em_status translate(em_stub *s, uint16_t cpu, uint64_t va, uint64_t *pa, uint32_t *flags)
+static em_status translate(em_stub *stub, uint16_t cpu, uint64_t va, uint64_t *pa, uint32_t *flags)
 {
-    if (s->ops->translate)
-        return s->ops->translate(s->user, cpu, va, pa, flags);
-    if (s->info.regblocks & EM_RB_BIT(EM_RB_X86_CTRL))
-        return walk_x86(s, cpu, va, pa, flags);
+    if (stub->ops->translate)
+        return stub->ops->translate(stub->user, cpu, va, pa, flags);
+    if (stub->info.regblocks & EM_RB_BIT(EM_RB_X86_CTRL))
+        return walk_x86(stub, cpu, va, pa, flags);
     return EM_E_UNSUPPORTED;
 }
 
-/* --- memory -------------------------------------------------------------------------- */
-
-static uint32_t page_chunk(uint64_t addr, uint32_t left)
+static uint32_t page_chunk(uint64_t addr, uint32_t remaining)
 {
-    uint32_t chunk = 0x1000u - (uint32_t)(addr & 0xFFFu);
+    uint32_t             chunk;
 
-    return em_min(chunk, left);
+    chunk = 0x1000u - (uint32_t)(addr & 0xFFFu);
+    return em_min(chunk, remaining);
 }
 
-static uint32_t mem_read(em_stub *s, uint16_t cpu, uint8_t space, uint64_t addr, uint8_t *buf,
+static uint32_t mem_read(em_stub *stub, uint16_t cpu, uint8_t space, uint64_t addr, uint8_t *buf,
                          uint32_t len)
 {
-    uint64_t pa;
-    uint32_t done = 0;
-    uint32_t chunk, n, flags;
+    uint64_t             phys_addr;
+    uint32_t             bytes_done;
+    uint32_t             chunk;
+    uint32_t             bytes_read;
+    uint32_t             xlate_flags;
 
     if (space == EM_SPACE_PHYS)
-        return s->ops->read_phys(s->user, addr, buf, len);
-    if (s->ops->read_virt)
-        return s->ops->read_virt(s->user, cpu, addr, buf, len);
+        return stub->ops->read_phys(stub->user, cpu, addr, buf, len);
+    if (stub->ops->read_virt)
+        return stub->ops->read_virt(stub->user, cpu, addr, buf, len);
 
-    while (done < len) {
-        chunk = page_chunk(addr + done, len - done);
-        if (translate(s, cpu, addr + done, &pa, &flags) != EM_OK)
+    bytes_done = 0;
+    while (bytes_done < len) {
+        chunk = page_chunk(addr + bytes_done, len - bytes_done);
+        if (translate(stub, cpu, addr + bytes_done, &phys_addr, &xlate_flags) != EM_OK)
             break;
-        n = s->ops->read_phys(s->user, pa, buf + done, chunk);
-        done += n;
-        if (n != chunk)
+        bytes_read = stub->ops->read_phys(stub->user, cpu, phys_addr, buf + bytes_done, chunk);
+        bytes_done += bytes_read;
+        if (bytes_read != chunk)
             break;
     }
-    return done;
+    return bytes_done;
 }
 
-static uint32_t mem_write(em_stub *s, uint16_t cpu, uint8_t space, uint64_t addr, const uint8_t *buf,
-                          uint32_t len)
+static uint32_t mem_write(em_stub *stub, uint16_t cpu, uint8_t space, uint64_t addr,
+                          const uint8_t *buf, uint32_t len)
 {
-    uint64_t pa;
-    uint32_t done = 0;
-    uint32_t chunk, n, flags;
+    uint64_t             phys_addr;
+    uint32_t             bytes_done;
+    uint32_t             chunk;
+    uint32_t             bytes_written;
+    uint32_t             xlate_flags;
 
     if (space == EM_SPACE_PHYS)
-        return s->ops->write_phys(s->user, addr, buf, len);
-    if (s->ops->write_virt)
-        return s->ops->write_virt(s->user, cpu, addr, buf, len);
+        return stub->ops->write_phys(stub->user, cpu, addr, buf, len);
+    if (stub->ops->write_virt)
+        return stub->ops->write_virt(stub->user, cpu, addr, buf, len);
 
-    while (done < len) {
-        chunk = page_chunk(addr + done, len - done);
-        if (translate(s, cpu, addr + done, &pa, &flags) != EM_OK)
+    bytes_done = 0;
+    while (bytes_done < len) {
+        chunk = page_chunk(addr + bytes_done, len - bytes_done);
+        if (translate(stub, cpu, addr + bytes_done, &phys_addr, &xlate_flags) != EM_OK)
             break;
-        n = s->ops->write_phys(s->user, pa, buf + done, chunk);
-        done += n;
-        if (n != chunk)
+        bytes_written = stub->ops->write_phys(stub->user, cpu, phys_addr, buf + bytes_done, chunk);
+        bytes_done += bytes_written;
+        if (bytes_written != chunk)
             break;
     }
-    return done;
+    return bytes_done;
 }
 
-/* --- register blocks ----------------------------------------------------------------- */
-
-/* Append em_rb_hdr + data for every block in `blocks` to out[*pos..cap). */
-static em_status append_blocks(em_stub *s, uint16_t cpu, uint32_t blocks, uint8_t *out,
+static em_status append_blocks(em_stub *stub, uint16_t cpu, uint32_t blocks, uint8_t *out,
                                uint32_t cap, uint32_t *pos)
 {
-    em_rb_hdr rb;
-    uint32_t  id;
-    int32_t   n;
+    em_rb_hdr            block_hdr;
+    uint32_t             block_id;
+    int32_t              block_size;
 
-    for (id = 0; id < 32; id++) {
-        if (!(blocks & EM_RB_BIT(id)))
+    for (block_id = 0; block_id < 32; block_id++) {
+        if (!(blocks & EM_RB_BIT(block_id)))
             continue;
-        if (*pos + sizeof rb > cap)
+        if (*pos + sizeof block_hdr > cap)
             return EM_E_BADARG;
-        n = s->ops->get_regs(s->user, cpu, id, out + *pos + sizeof rb,
-                             cap - *pos - (uint32_t)sizeof rb);
-        if (n < 0)
-            return (em_status)-n;
-        rb.id = (uint16_t)id;
-        rb.reserved = 0;
-        rb.size = (uint32_t)n;
-        em_memcpy(out + *pos, &rb, sizeof rb);
-        *pos += (uint32_t)sizeof rb + (uint32_t)n;
+        block_size = stub->ops->get_regs(stub->user, cpu, block_id, out + *pos + sizeof block_hdr,
+                                         cap - *pos - (uint32_t)sizeof block_hdr);
+        if (block_size < 0)
+            return (em_status)-block_size;
+        block_hdr.id = (uint16_t)block_id;
+        block_hdr.reserved = 0;
+        block_hdr.size = (uint32_t)block_size;
+        em_memcpy(out + *pos, &block_hdr, sizeof block_hdr);
+        *pos += (uint32_t)sizeof block_hdr + (uint32_t)block_size;
     }
     return EM_OK;
 }
 
-/* Hand one incoming block to set_regs at its full local size. A shorter block (from an
- * older debugger) is laid over the current values so unknown fields keep their contents;
- * a longer one (from a newer debugger) is cut to what this stub knows. */
-static em_status set_block(em_stub *s, uint16_t cpu, uint32_t id, const uint8_t *data, uint32_t size)
+static em_status set_block(em_stub *stub, uint16_t cpu, uint32_t block_id, const uint8_t *data,
+                           uint32_t size)
 {
-    uint32_t local = em_x86_rb_size(id);
-    int32_t  n;
+    uint32_t             local_size;
+    int32_t              result;
 
-    if (!local || !(s->info.regblocks & EM_RB_BIT(id)))
+    local_size = em_x86_rb_size(block_id);
+    if (!local_size || !(stub->info.regblocks & EM_RB_BIT(block_id)))
         return EM_E_UNSUPPORTED;
-    if (size < local) {
-        n = s->ops->get_regs(s->user, cpu, id, s->scratch, local);
-        if (n < 0)
-            return (em_status)-n;
+    if (size < local_size) {
+        result = stub->ops->get_regs(stub->user, cpu, block_id, stub->scratch, local_size);
+        if (result < 0)
+            return (em_status)-result;
     }
-    em_memcpy(s->scratch, data, em_min(size, local));
-    return s->ops->set_regs(s->user, cpu, id, s->scratch, local);
+    em_memcpy(stub->scratch, data, em_min(size, local_size));
+    return stub->ops->set_regs(stub->user, cpu, block_id, stub->scratch, local_size);
 }
 
-/* --- command handlers ---------------------------------------------------------------
- * Each gets the request payload (fixed part + tail), already checked for minimum size,
- * writes its reply payload to TX_PAYLOAD(s), sets s->tx_len and returns the status.
- * Payloads are copied into locals: the rx buffer gives no alignment guarantees. */
+typedef em_status (*em_handler)(em_stub *stub, const uint8_t *req, uint32_t len);
 
-typedef em_status (*em_handler)(em_stub *s, const uint8_t *req, uint32_t len);
-
-#define EM_X(name, id, rq, rp, fl) static em_status h_##name(em_stub *, const uint8_t *, uint32_t);
+#define EM_X(name, id, request_type, reply_type, flags) \
+    static em_status h_##name(em_stub *, const uint8_t *, uint32_t);
 EM_COMMANDS(EM_X)
 #undef EM_X
 
 static em_handler handler_for(uint16_t type)
 {
     switch (type) {
-#define EM_X(name, id, rq, rp, fl) case id: return h_##name;
-    EM_COMMANDS(EM_X)
+#define EM_X(name, id, request_type, reply_type, flags) \
+        case id:                                        \
+            return h_##name;
+        EM_COMMANDS(EM_X)
 #undef EM_X
     }
     return NULL;
 }
 
-static int cpu_ok(const em_stub *s, uint16_t cpu)
+static int cpu_ok(const em_stub *stub, uint16_t cpu)
 {
-    return cpu < s->info.cpu_count;
+    return cpu < stub->info.cpu_count;
 }
 
-static void reply(em_stub *s, const void *data, uint32_t len)
+static void reply(em_stub *stub, const void *data, uint32_t len)
 {
-    em_memcpy(TX_PAYLOAD(s), data, len);
-    s->tx_len = len;
+    em_memcpy(TX_PAYLOAD(stub), data, len);
+    stub->tx_len = len;
 }
 
-static em_status h_HELLO(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_HELLO(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_hello_req q;
-    em_hello_rep r;
-    uint32_t     i;
+    em_hello_req         hello_req;
+    em_hello_rep         hello_rep;
+    uint32_t             char_index;
 
     (void)len;
-    em_memcpy(&q, req, sizeof q);
-    s->peer_max = q.max_payload < EM_MIN_PAYLOAD ? EM_MIN_PAYLOAD : q.max_payload;
+    em_memcpy(&hello_req, req, sizeof hello_req);
+    stub->peer_max = hello_req.max_payload < EM_MIN_PAYLOAD ? EM_MIN_PAYLOAD : hello_req.max_payload;
 
-    em_memset(&r, 0, sizeof r);
-    r.version     = EM_PROTO_VERSION;
-    r.max_payload = EM_STUB_MAX_PAYLOAD;
-    r.commands[0] = s->commands[0];
-    r.commands[1] = s->commands[1];
-    r.features    = s->info.features;
-    r.regblocks   = s->info.regblocks;
-    r.arch        = EM_ARCH_X86;
-    r.cpu_count   = s->info.cpu_count;
-    for (i = 0; s->info.target && s->info.target[i] && i < sizeof r.target - 1; i++)
-        r.target[i] = s->info.target[i];
-    reply(s, &r, sizeof r);
+    em_memset(&hello_rep, 0, sizeof hello_rep);
+    hello_rep.version     = EM_PROTO_VERSION;
+    hello_rep.max_payload = EM_STUB_MAX_PAYLOAD;
+    hello_rep.commands[0] = stub->commands[0];
+    hello_rep.commands[1] = stub->commands[1];
+    hello_rep.features    = stub->info.features;
+    hello_rep.regblocks   = stub->info.regblocks;
+    hello_rep.arch        = EM_ARCH_X86;
+    hello_rep.cpu_count   = stub->info.cpu_count;
+    for (char_index = 0; stub->info.target && stub->info.target[char_index] &&
+         char_index < sizeof hello_rep.target - 1; char_index++)
+        hello_rep.target[char_index] = stub->info.target[char_index];
+    reply(stub, &hello_rep, sizeof hello_rep);
     return EM_OK;
 }
 
-static em_status h_GET_REGS(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_GET_REGS(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_regs_req q;
-    uint32_t    pos = 0;
-    em_status   st;
+    em_regs_req          regs_req;
+    uint32_t             payload_pos;
+    em_status            status;
 
     (void)len;
-    em_memcpy(&q, req, sizeof q);
-    if (!cpu_ok(s, q.cpu))
+    em_memcpy(&regs_req, req, sizeof regs_req);
+    if (!cpu_ok(stub, regs_req.cpu))
         return EM_E_BADARG;
-    st = append_blocks(s, q.cpu, q.blocks & s->info.regblocks, TX_PAYLOAD(s), tx_cap(s), &pos);
-    s->tx_len = pos;
-    return st;
+    payload_pos = 0;
+    status = append_blocks(stub, regs_req.cpu, regs_req.blocks & stub->info.regblocks,
+                           TX_PAYLOAD(stub), tx_cap(stub), &payload_pos);
+    stub->tx_len = payload_pos;
+    return status;
 }
 
-static em_status h_SET_REGS(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_SET_REGS(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_regs_req q;
-    em_rb_hdr   rb;
-    uint32_t    pos;
-    em_status   st;
+    em_regs_req          regs_req;
+    em_rb_hdr            block_hdr;
+    uint32_t             payload_pos;
+    em_status            status;
 
-    em_memcpy(&q, req, sizeof q);
-    if (!cpu_ok(s, q.cpu))
+    em_memcpy(&regs_req, req, sizeof regs_req);
+    if (!cpu_ok(stub, regs_req.cpu))
         return EM_E_BADARG;
-    for (pos = sizeof q; pos + sizeof rb <= len; pos += rb.size) {
-        em_memcpy(&rb, req + pos, sizeof rb);
-        pos += (uint32_t)sizeof rb;
-        if (rb.size > len - pos)
+    for (payload_pos = sizeof regs_req; payload_pos + sizeof block_hdr <= len;
+         payload_pos += block_hdr.size) {
+        em_memcpy(&block_hdr, req + payload_pos, sizeof block_hdr);
+        payload_pos += (uint32_t)sizeof block_hdr;
+        if (block_hdr.size > len - payload_pos)
             return EM_E_BADARG;
-        st = set_block(s, q.cpu, rb.id, req + pos, rb.size);
-        if (st != EM_OK)
-            return st;
+        status = set_block(stub, regs_req.cpu, block_hdr.id, req + payload_pos, block_hdr.size);
+        if (status != EM_OK)
+            return status;
     }
     return EM_OK;
 }
 
-static em_status h_READ_MEM(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_READ_MEM(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_mem_req q;
-    uint32_t   n;
+    em_mem_req           mem_req;
+    uint32_t             bytes_read;
 
     (void)len;
-    em_memcpy(&q, req, sizeof q);
-    if (q.space > EM_SPACE_PHYS || !cpu_ok(s, q.cpu) || q.len > tx_cap(s))
+    em_memcpy(&mem_req, req, sizeof mem_req);
+    if (mem_req.space > EM_SPACE_PHYS || !cpu_ok(stub, mem_req.cpu) || mem_req.len > tx_cap(stub))
         return EM_E_BADARG;
-    n = mem_read(s, q.cpu, q.space, q.addr, TX_PAYLOAD(s), q.len);
-    s->tx_len = n;
-    return n == q.len ? EM_OK : n ? EM_E_PARTIAL : EM_E_FAULT;
+    bytes_read = mem_read(stub, mem_req.cpu, mem_req.space, mem_req.addr, TX_PAYLOAD(stub),
+                          mem_req.len);
+    stub->tx_len = bytes_read;
+    return bytes_read == mem_req.len ? EM_OK : bytes_read ? EM_E_PARTIAL : EM_E_FAULT;
 }
 
-static em_status h_WRITE_MEM(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_WRITE_MEM(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_mem_req q;
-    uint32_t   n;
+    em_mem_req           mem_req;
+    uint32_t             bytes_written;
 
-    em_memcpy(&q, req, sizeof q);
-    if (q.space > EM_SPACE_PHYS || !cpu_ok(s, q.cpu) || q.len != len - sizeof q)
+    em_memcpy(&mem_req, req, sizeof mem_req);
+    if (mem_req.space > EM_SPACE_PHYS || !cpu_ok(stub, mem_req.cpu) ||
+        mem_req.len != len - sizeof mem_req)
         return EM_E_BADARG;
-    n = mem_write(s, q.cpu, q.space, q.addr, req + sizeof q, q.len);
-    return n == q.len ? EM_OK : n ? EM_E_PARTIAL : EM_E_FAULT;
+    bytes_written = mem_write(stub, mem_req.cpu, mem_req.space, mem_req.addr,
+                              req + sizeof mem_req, mem_req.len);
+    return bytes_written == mem_req.len ? EM_OK : bytes_written ? EM_E_PARTIAL : EM_E_FAULT;
 }
 
-static em_status h_TRANSLATE(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_TRANSLATE(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_xlate_req q;
-    em_xlate_rep r;
-    em_status    st;
+    em_xlate_req         xlate_req;
+    em_xlate_rep         xlate_rep;
+    em_status            status;
 
     (void)len;
-    em_memcpy(&q, req, sizeof q);
-    if (!cpu_ok(s, q.cpu))
+    em_memcpy(&xlate_req, req, sizeof xlate_req);
+    if (!cpu_ok(stub, xlate_req.cpu))
         return EM_E_BADARG;
-    em_memset(&r, 0, sizeof r);
-    st = translate(s, q.cpu, q.vaddr, &r.paddr, &r.flags);
-    if (st == EM_OK)
-        reply(s, &r, sizeof r);
-    return st;
+    em_memset(&xlate_rep, 0, sizeof xlate_rep);
+    status = translate(stub, xlate_req.cpu, xlate_req.vaddr, &xlate_rep.paddr, &xlate_rep.flags);
+    if (status == EM_OK)
+        reply(stub, &xlate_rep, sizeof xlate_rep);
+    return status;
 }
 
-static void set_resume(em_stub *s, em_resume_action action, uint16_t cpu)
+static void set_resume(em_stub *stub, em_resume_action action, uint16_t cpu)
 {
-    s->resume.action = action;
-    s->resume.cpu = cpu;
-    s->resume_set = 1;
+    stub->resume.action = action;
+    stub->resume.cpu = cpu;
+    stub->resume_set = 1;
 }
 
-static em_status h_CONTINUE(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_CONTINUE(em_stub *stub, const uint8_t *req, uint32_t len)
 {
     (void)req;
     (void)len;
-    set_resume(s, EM_RESUME_CONTINUE, 0);
+    set_resume(stub, EM_RESUME_CONTINUE, 0);
     return EM_OK;
 }
 
-static em_status h_STEP(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_STEP(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_step_req q;
+    em_step_req          step_req;
 
     (void)len;
-    em_memcpy(&q, req, sizeof q);
-    if (!cpu_ok(s, q.cpu))
+    em_memcpy(&step_req, req, sizeof step_req);
+    if (!cpu_ok(stub, step_req.cpu))
         return EM_E_BADARG;
-    set_resume(s, EM_RESUME_STEP, q.cpu);
+    set_resume(stub, EM_RESUME_STEP, step_req.cpu);
     return EM_OK;
 }
 
-static em_status h_PAUSE(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_PAUSE(em_stub *stub, const uint8_t *req, uint32_t len)
 {
     (void)req;
     (void)len;
-    if (s->running)
-        s->pause_req = 1;
+    if (stub->running)
+        stub->pause_req = 1;
     return EM_OK;
 }
 
-static em_status h_BP_SET(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_BP_SET(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_bp_req q;
-    em_bp_rep r;
-    em_status st;
+    em_bp_req            bp_req;
+    em_bp_rep            bp_rep;
+    em_status            status;
 
     (void)len;
-    em_memcpy(&q, req, sizeof q);
-    em_memset(&r, 0, sizeof r);
-    st = s->ops->bp_set(s->user, &q, &r.id);
-    if (st == EM_OK)
-        reply(s, &r, sizeof r);
-    return st;
+    em_memcpy(&bp_req, req, sizeof bp_req);
+    em_memset(&bp_rep, 0, sizeof bp_rep);
+    status = stub->ops->bp_set(stub->user, &bp_req);
+    if (status == EM_OK)
+        reply(stub, &bp_rep, sizeof bp_rep);
+    return status;
 }
 
-static em_status h_BP_CLEAR(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_BP_CLEAR(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_bp_id q;
+    em_bp_req            bp_req;
 
     (void)len;
-    em_memcpy(&q, req, sizeof q);
-    return s->ops->bp_clear(s->user, q.id);
+    em_memcpy(&bp_req, req, sizeof bp_req);
+    return stub->ops->bp_clear(stub->user, &bp_req);
 }
 
-static em_status h_READ_MSR(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_READ_MSR(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_msr    q;
-    em_status st;
+    em_msr               msr;
+    em_status            status;
 
     (void)len;
-    em_memcpy(&q, req, sizeof q);
-    if (!cpu_ok(s, q.cpu))
+    em_memcpy(&msr, req, sizeof msr);
+    if (!cpu_ok(stub, msr.cpu))
         return EM_E_BADARG;
-    st = s->ops->read_msr(s->user, q.cpu, q.index, &q.value);
-    if (st == EM_OK)
-        reply(s, &q, sizeof q);
-    return st;
+    status = stub->ops->read_msr(stub->user, msr.cpu, msr.index, &msr.value);
+    if (status == EM_OK)
+        reply(stub, &msr, sizeof msr);
+    return status;
 }
 
-static em_status h_WRITE_MSR(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_WRITE_MSR(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_msr q;
+    em_msr               msr;
 
     (void)len;
-    em_memcpy(&q, req, sizeof q);
-    if (!cpu_ok(s, q.cpu))
+    em_memcpy(&msr, req, sizeof msr);
+    if (!cpu_ok(stub, msr.cpu))
         return EM_E_BADARG;
-    return s->ops->write_msr(s->user, q.cpu, q.index, q.value);
+    return stub->ops->write_msr(stub->user, msr.cpu, msr.index, msr.value);
 }
 
-static em_status h_SNAP_SAVE(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_SNAP_SAVE(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_name_req q;
+    em_name_req          name_req;
 
     (void)len;
-    em_memcpy(&q, req, sizeof q);
-    q.name[sizeof q.name - 1] = '\0';
-    return s->ops->snap_save(s->user, q.name);
+    em_memcpy(&name_req, req, sizeof name_req);
+    name_req.name[sizeof name_req.name - 1] = '\0';
+    return stub->ops->snap_save(stub->user, name_req.name);
 }
 
-static em_status h_SNAP_LOAD(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_SNAP_LOAD(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_name_req q;
+    em_name_req          name_req;
 
     (void)len;
-    em_memcpy(&q, req, sizeof q);
-    q.name[sizeof q.name - 1] = '\0';
-    return s->ops->snap_load(s->user, q.name);
+    em_memcpy(&name_req, req, sizeof name_req);
+    name_req.name[sizeof name_req.name - 1] = '\0';
+    return stub->ops->snap_load(stub->user, name_req.name);
 }
 
-static em_status h_MONITOR(em_stub *s, const uint8_t *req, uint32_t len)
+static em_status h_MONITOR(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    const char *cmd = (const char *)req + sizeof(em_empty);
-    uint32_t    cmd_len = len - (uint32_t)sizeof(em_empty);
+    const char           *command;
+    uint32_t             command_len;
 
-    s->tx_len = s->ops->monitor(s->user, cmd, cmd_len, (char *)TX_PAYLOAD(s), tx_cap(s));
+    command = (const char *)req + sizeof(em_empty);
+    command_len = len - (uint32_t)sizeof(em_empty);
+    stub->tx_len = stub->ops->monitor(stub->user, command, command_len, (char *)TX_PAYLOAD(stub),
+                                      tx_cap(stub));
     return EM_OK;
 }
 
-/* --- dispatch ------------------------------------------------------------------------ */
-
-static void set_command(em_stub *s, uint16_t id)
+static void set_command(em_stub *stub, uint16_t command_id)
 {
-    s->commands[id / 64] |= 1ull << (id % 64);
+    stub->commands[command_id / 64] |= 1ull << (command_id % 64);
 }
 
-static int command_supported(const em_stub *s, uint16_t id)
+static int command_supported(const em_stub *stub, uint16_t command_id)
 {
-    return id < EM_CMD_ID_LIMIT && (s->commands[id / 64] & (1ull << (id % 64)));
+    return command_id < EM_CMD_ID_LIMIT &&
+           (stub->commands[command_id / 64] & (1ull << (command_id % 64)));
 }
 
-static void compute_commands(em_stub *s)
+static void compute_commands(em_stub *stub)
 {
-    const em_stub_ops *o = s->ops;
+    const em_stub_ops    *ops;
 
-    s->commands[0] = 0;
-    s->commands[1] = 0;
-    set_command(s, EM_CMD_HELLO);
-    set_command(s, EM_CMD_GET_REGS);
-    set_command(s, EM_CMD_SET_REGS);
-    set_command(s, EM_CMD_READ_MEM);
-    set_command(s, EM_CMD_WRITE_MEM);
-    set_command(s, EM_CMD_CONTINUE);
-    set_command(s, EM_CMD_STEP);
-    set_command(s, EM_CMD_PAUSE);
-    if (o->translate || (s->info.regblocks & EM_RB_BIT(EM_RB_X86_CTRL)))
-        set_command(s, EM_CMD_TRANSLATE);
-    if (o->bp_set && o->bp_clear) {
-        set_command(s, EM_CMD_BP_SET);
-        set_command(s, EM_CMD_BP_CLEAR);
+    ops = stub->ops;
+    stub->commands[0] = 0;
+    stub->commands[1] = 0;
+    set_command(stub, EM_CMD_HELLO);
+    set_command(stub, EM_CMD_GET_REGS);
+    set_command(stub, EM_CMD_SET_REGS);
+    set_command(stub, EM_CMD_READ_MEM);
+    set_command(stub, EM_CMD_WRITE_MEM);
+    set_command(stub, EM_CMD_CONTINUE);
+    set_command(stub, EM_CMD_STEP);
+    set_command(stub, EM_CMD_PAUSE);
+    if (ops->translate || (stub->info.regblocks & EM_RB_BIT(EM_RB_X86_CTRL)))
+        set_command(stub, EM_CMD_TRANSLATE);
+    if (ops->bp_set && ops->bp_clear) {
+        set_command(stub, EM_CMD_BP_SET);
+        set_command(stub, EM_CMD_BP_CLEAR);
     }
-    if (o->read_msr)
-        set_command(s, EM_CMD_READ_MSR);
-    if (o->write_msr)
-        set_command(s, EM_CMD_WRITE_MSR);
-    if (o->snap_save)
-        set_command(s, EM_CMD_SNAP_SAVE);
-    if (o->snap_load)
-        set_command(s, EM_CMD_SNAP_LOAD);
-    if (o->monitor)
-        set_command(s, EM_CMD_MONITOR);
+    if (ops->read_msr)
+        set_command(stub, EM_CMD_READ_MSR);
+    if (ops->write_msr)
+        set_command(stub, EM_CMD_WRITE_MSR);
+    if (ops->snap_save)
+        set_command(stub, EM_CMD_SNAP_SAVE);
+    if (ops->snap_load)
+        set_command(stub, EM_CMD_SNAP_LOAD);
+    if (ops->monitor)
+        set_command(stub, EM_CMD_MONITOR);
 }
 
-/* Run the request in s->rx and send its reply. */
-static void handle_packet(em_stub *s)
+static void handle_packet(em_stub *stub)
 {
-    em_hdr     h;
-    em_handler fn;
-    em_status  st;
-    uint32_t   flags, fixed;
+    em_hdr               header;
+    em_handler           handler;
+    em_status            status;
+    uint32_t             type_flags;
+    uint32_t             fixed_size;
 
-    em_memcpy(&h, s->rx, sizeof h);
-    fn    = handler_for(h.type);
-    flags = em_type_flags(h.type);
-    fixed = em_req_size(h.type);
-    s->tx_len = 0;
+    em_memcpy(&header, stub->rx, sizeof header);
+    handler    = handler_for(header.type);
+    type_flags = em_type_flags(header.type);
+    fixed_size = em_req_size(header.type);
+    stub->tx_len = 0;
 
-    if (!fn || !command_supported(s, h.type))
-        st = EM_E_UNSUPPORTED;
-    else if (h.len < fixed || (!(flags & EM_F_REQ_TAIL) && h.len != fixed))
-        st = EM_E_BADARG;
-    else if (s->running && !(flags & EM_F_RUNNING))
-        st = EM_E_RUNNING;
+    if (!handler || !command_supported(stub, header.type))
+        status = EM_E_UNSUPPORTED;
+    else if (header.len < fixed_size || (!(type_flags & EM_F_REQ_TAIL) && header.len != fixed_size))
+        status = EM_E_BADARG;
+    else if (stub->running && !(type_flags & EM_F_RUNNING))
+        status = EM_E_RUNNING;
     else {
-        s->in_handler = 1;
-        st = fn(s, RX_PAYLOAD(s), h.len);
-        s->in_handler = 0;
+        stub->in_handler = 1;
+        status = handler(stub, RX_PAYLOAD(stub), header.len);
+        stub->in_handler = 0;
     }
 
-    /* A failed reply may be shorter than the fixed reply size; the debugger checks
-     * status before reading the payload. */
-    send_packet(s, h.type, EM_KIND_REPLY, st, h.seq, s->tx_len);
+    send_packet(stub, header.type, EM_KIND_REPLY, status, header.seq, stub->tx_len);
 }
 
-/* Serve every request that is already waiting, without blocking. */
-static void service(em_stub *s)
+static void service(em_stub *stub)
 {
-    while (s->connected && recv_packet(s, 0) > 0)
-        handle_packet(s);
+    while (stub->connected && recv_packet(stub, 0) > 0)
+        handle_packet(stub);
 }
 
-static void send_stopped(em_stub *s, uint16_t cpu, em_stop_reason reason, uint32_t bp_id,
+static void send_stopped(em_stub *stub, uint16_t cpu, em_stop_reason reason, uint32_t bp_id,
                          uint64_t addr)
 {
-    em_stopped ev;
-    uint32_t   pos;
+    em_stopped           stopped_event;
+    uint32_t             payload_pos;
 
-    ev.cpu      = cpu;
-    ev.reason   = (uint8_t)reason;
-    ev.reserved = 0;
-    ev.bp_id    = bp_id;
-    ev.addr     = addr;
-    em_memcpy(TX_PAYLOAD(s), &ev, sizeof ev);
-    pos = (uint32_t)sizeof ev;
+    stopped_event.cpu      = cpu;
+    stopped_event.reason   = (uint8_t)reason;
+    stopped_event.reserved = 0;
+    stopped_event.bp_id    = bp_id;
+    stopped_event.addr     = addr;
+    em_memcpy(TX_PAYLOAD(stub), &stopped_event, sizeof stopped_event);
+    payload_pos = (uint32_t)sizeof stopped_event;
 
-    if (append_blocks(s, cpu, EM_RB_STOPPED_SET & s->info.regblocks, TX_PAYLOAD(s), tx_cap(s),
-                      &pos) != EM_OK)
-        pos = (uint32_t)sizeof ev;   /* registers unavailable: the debugger asks with GET_REGS */
-    send_packet(s, EM_EV_STOPPED, EM_KIND_EVENT, EM_OK, 0, pos);
+    if (append_blocks(stub, cpu, EM_RB_STOPPED_SET & stub->info.regblocks, TX_PAYLOAD(stub),
+                      tx_cap(stub), &payload_pos) != EM_OK)
+        payload_pos = (uint32_t)sizeof stopped_event;
+    send_packet(stub, EM_EV_STOPPED, EM_KIND_EVENT, EM_OK, 0, payload_pos);
 }
 
-/* --- public API ---------------------------------------------------------------------- */
-
-void em_stub_init(em_stub *s, const em_stub_ops *ops, void *user, const em_stub_info *info)
+void em_stub_init(em_stub *stub, const em_stub_ops *ops, void *user, const em_stub_info *info)
 {
-    em_memset(s, 0, sizeof *s);
-    s->ops      = ops;
-    s->user     = user;
-    s->info     = *info;
-    s->peer_max = EM_MIN_PAYLOAD;
-    compute_commands(s);
+    em_memset(stub, 0, sizeof *stub);
+    stub->ops      = ops;
+    stub->user     = user;
+    stub->info     = *info;
+    stub->peer_max = EM_MIN_PAYLOAD;
+    compute_commands(stub);
 }
 
-void em_stub_reset(em_stub *s, int running)
+void em_stub_reset(em_stub *stub, int running)
 {
-    s->connected    = 1;
-    s->running      = (uint8_t)(running != 0);
-    s->pause_req    = 0;
-    s->in_handler   = 0;
-    s->resume_set   = 0;
-    s->rx_have      = 0;
-    s->peer_max     = EM_MIN_PAYLOAD;
+    stub->connected    = 1;
+    stub->running      = (uint8_t)(running != 0);
+    stub->pause_req    = 0;
+    stub->in_handler   = 0;
+    stub->resume_set   = 0;
+    stub->rx_have      = 0;
+    stub->peer_max     = EM_MIN_PAYLOAD;
 }
 
-int em_stub_connected(const em_stub *s)
+int em_stub_connected(const em_stub *stub)
 {
-    return s->connected;
+    return stub->connected;
 }
 
-em_run em_stub_poll(em_stub *s)
+em_run em_stub_poll(em_stub *stub)
 {
-    if (!s->connected)
+    if (!stub->connected)
         return EM_RUN_CONTINUE;
-    service(s);
-    if (s->pause_req) {
-        s->pause_req = 0;
+    service(stub);
+    if (stub->pause_req) {
+        stub->pause_req = 0;
         return EM_RUN_STOP;
     }
     return EM_RUN_CONTINUE;
 }
 
-em_resume em_stub_stopped(em_stub *s, uint16_t cpu, em_stop_reason reason, uint32_t bp_id,
+em_resume em_stub_stopped(em_stub *stub, uint16_t cpu, em_stop_reason reason, uint32_t bp_id,
                           uint64_t addr)
 {
-    em_resume detach;
+    em_resume            detach_resume;
 
-    detach.action = EM_RESUME_DETACH;
-    detach.cpu = cpu;
-    if (!s->connected)
-        return detach;
+    detach_resume.action = EM_RESUME_DETACH;
+    detach_resume.cpu = cpu;
+    if (!stub->connected)
+        return detach_resume;
 
-    s->running    = 0;
-    s->pause_req  = 0;
-    s->resume_set = 0;
+    stub->running    = 0;
+    stub->pause_req  = 0;
+    stub->resume_set = 0;
 
-    send_stopped(s, cpu, reason, bp_id, addr);
-    while (s->connected && !s->resume_set) {
-        if (recv_packet(s, 1) > 0)
-            handle_packet(s);
+    send_stopped(stub, cpu, reason, bp_id, addr);
+    while (stub->connected && !stub->resume_set) {
+        if (recv_packet(stub, 1) > 0)
+            handle_packet(stub);
     }
-    if (!s->connected)
-        return detach;
+    if (!stub->connected)
+        return detach_resume;
 
-    s->running = 1;
-    return s->resume;
+    stub->running = 1;
+    return stub->resume;
 }
 
-int em_stub_output(em_stub *s, const char *text, uint32_t len)
+int em_stub_output(em_stub *stub, const char *text, uint32_t len)
 {
-    if (!s->connected || s->in_handler)
+    if (!stub->connected || stub->in_handler)
         return -1;
-    len = em_min(len, tx_cap(s));
-    em_memcpy(TX_PAYLOAD(s), text, len);
-    return send_packet(s, EM_EV_OUTPUT, EM_KIND_EVENT, EM_OK, 0, len);
+    len = em_min(len, tx_cap(stub));
+    em_memcpy(TX_PAYLOAD(stub), text, len);
+    return send_packet(stub, EM_EV_OUTPUT, EM_KIND_EVENT, EM_OK, 0, len);
 }
