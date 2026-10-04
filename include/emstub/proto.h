@@ -191,8 +191,8 @@ EM_STATIC_ASSERT(sizeof(em_stopped) == 16, "em_stopped layout");
     X(CONTINUE,   0x07, em_empty,        em_empty,      0)                                       \
     X(STEP,       0x08, em_step_req,     em_empty,      0)                                       \
     X(PAUSE,      0x09, em_empty,        em_empty,      EM_F_RUNNING)                            \
-    X(BP_SET,     0x0A, em_bp_req,       em_bp_rep,     EM_F_RUNNING)                            \
-    X(BP_CLEAR,   0x0B, em_bp_id,        em_empty,      EM_F_RUNNING)                            \
+    X(BP_SET,     0x0A, em_bp_req,       em_empty,     EM_F_RUNNING)                            \
+    X(BP_CLEAR,   0x0B, em_bp_req        em_empty,      EM_F_RUNNING)                            \
     X(READ_MSR,   0x0C, em_msr,          em_msr,        0)                                       \
     X(WRITE_MSR,  0x0D, em_msr,          em_empty,      0)                                       \
     X(SNAP_SAVE,  0x0E, em_name_req,     em_empty,      0)                                       \

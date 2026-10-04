@@ -508,15 +508,12 @@ static em_status h_PAUSE(em_stub *stub, const uint8_t *req, uint32_t len)
 static em_status h_BP_SET(em_stub *stub, const uint8_t *req, uint32_t len)
 {
     em_bp_req            bp_req;
-    em_bp_rep            bp_rep;
     em_status            status;
 
     (void)len;
     em_memcpy(&bp_req, req, sizeof bp_req);
-    em_memset(&bp_rep, 0, sizeof bp_rep);
     status = stub->ops->bp_set(stub->user, &bp_req);
-    if (status == EM_OK)
-        reply(stub, &bp_rep, sizeof bp_rep);
+    
     return status;
 }
 
