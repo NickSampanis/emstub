@@ -278,7 +278,7 @@ static int32_t op_recv(void *user, void *buf, uint32_t len, int block)
     return n > 0 ? n : -1;
 }
 
-static uint32_t op_read_phys(void *user, uint64_t pa, void *buf, uint32_t len)
+static uint32_t op_read_phys(void *user, uint16_t cpu, uint64_t pa, void *buf, uint32_t len)
 {
     (void)user;
     if (pa >= RAM_SIZE)
@@ -289,7 +289,7 @@ static uint32_t op_read_phys(void *user, uint64_t pa, void *buf, uint32_t len)
     return len;
 }
 
-static uint32_t op_write_phys(void *user, uint64_t pa, const void *buf, uint32_t len)
+static uint32_t op_write_phys(void *user, uint16_t cpu, uint64_t pa, const void *buf, uint32_t len)
 {
     (void)user;
     if (pa >= RAM_SIZE)
@@ -338,32 +338,38 @@ static em_status op_set_regs(void *user, uint16_t cpu, uint32_t id, const void *
     return EM_OK;
 }
 
-static em_status op_bp_set(void *user, const em_bp_req *req, uint32_t *id)
+static em_status op_bp_set(void *user, const em_bp_req *req)
 {
     uint32_t i;
 
     (void)user;
-    if (req->type != EM_BP_EXEC || req->space != EM_SPACE_VIRT || req->addr == 0)
+    if (req->type != EM_BP_EXEC || req->space != EM_SPACE_VIRT)
         return EM_E_UNSUPPORTED;
     for (i = 0; i < MAX_BPS; i++) {
         if (!bps[i]) {
             bps[i] = req->addr;
-            *id = i + 1;
             return EM_OK;
         }
     }
     return EM_E_BADARG;
 }
 
-static em_status op_bp_clear(void *user, uint32_t id)
+static em_status op_bp_clear(void *user, const em_bp_req *req)
 {
+    uint32_t i;
+
     (void)user;
-    if (id == 0 || id > MAX_BPS || !bps[id - 1])
-        return EM_E_BADARG;
-    bps[id - 1] = 0;
+
+   if (req->type != EM_BP_EXEC || req->space != EM_SPACE_VIRT)
+        return EM_E_UNSUPPORTED;
+    for (i = 0; i < MAX_BPS; i++) {
+        if (bps[i] == req->addr) {
+            bps[i] = 0;
+            return EM_OK;
+        }
+    }
     return EM_OK;
 }
-
 static uint32_t op_monitor(void *user, const char *cmd, uint32_t cmd_len, char *out, uint32_t cap)
 {
     int n;

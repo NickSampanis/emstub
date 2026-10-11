@@ -40,8 +40,8 @@ static int32_t t_recv(void *u, void *b, uint32_t n, int block)
     to_stub_pos += n;
     return (int32_t)n;
 }
-static uint32_t t_rphys(void *u, uint64_t pa, void *b, uint32_t n) { (void)u; if (pa + n > sizeof mem) return 0; memcpy(b, mem + pa, n); return n; }
-static uint32_t t_wphys(void *u, uint64_t pa, const void *b, uint32_t n) { (void)u; if (pa + n > sizeof mem) return 0; memcpy(mem + pa, b, n); return n; }
+static uint32_t t_rphys(void *u, uint16_t cpu, uint64_t pa, void *b, uint32_t n) { (void)u; if (pa + n > sizeof mem) return 0; memcpy(b, mem + pa, n); return n; }
+static uint32_t t_wphys(void *u, uint16_t cpu, uint64_t pa, const void *b, uint32_t n) { (void)u; if (pa + n > sizeof mem) return 0; memcpy(mem + pa, b, n); return n; }
 static int32_t t_get(void *u, uint16_t cpu, uint32_t blk, void *b, uint32_t cap)
 {
     (void)u; (void)cpu;
