@@ -414,14 +414,14 @@ static snapshot *snap_by_name(const char *name)
     return NULL;
 }
 
-static snapshot *snap_by_id(const char *id)
+static snapshot *snap_by_id(const char *id, const char *name)
 {
     char     text[16];
     uint32_t index;
 
     for (index = 0; index < snap_count; index++) {
         snprintf(text, sizeof text, "%u", snaps[index].id);
-        if (!strcmp(text, id))
+        if (!strcmp(text, id) && !strcmp(snaps[index].name, name))
             return &snaps[index];
     }
     return NULL;
@@ -434,7 +434,7 @@ static void snap_describe(const snapshot *snap, em_snap_info *info)
     info->saved_at = snap->saved_at;
 }
 
-/* Like QEMU's savevm: a name that already exists is replaced by a new snapshot with a new id. */
+/* Saving to a name that already exists updates that snapshot in place; its id stays. */
 static em_status op_snap_save(void *user, const char *name, em_snap_info *saved)
 {
     snapshot *snap;
@@ -459,10 +459,10 @@ static em_status op_snap_save(void *user, const char *name, em_snap_info *saved)
         snap->ram = malloc(RAM_SIZE);
         if (!snap->ram)
             return EM_E_FAULT;
+        snprintf(snap->name, sizeof snap->name, "%s", name);
+        snap->id = ++snap_next_id;
         snap_count++;
     }
-    snprintf(snap->name, sizeof snap->name, "%s", name);
-    snap->id = ++snap_next_id;
     snap->saved_at = (uint64_t)time(NULL);
     snap->executed = executed;
     memcpy(snap->ram, ram, RAM_SIZE);
@@ -473,12 +473,12 @@ static em_status op_snap_save(void *user, const char *name, em_snap_info *saved)
     return EM_OK;
 }
 
-static em_status op_snap_load(void *user, const char *id)
+static em_status op_snap_load(void *user, const char *id, const char *name)
 {
     snapshot *snap;
 
     (void)user;
-    snap = snap_by_id(id);
+    snap = snap_by_id(id, name);
     if (!snap)
         return EM_E_BADARG;
     memcpy(ram, snap->ram, RAM_SIZE);
@@ -504,12 +504,12 @@ static em_status op_snap_info(void *user, uint32_t index, em_snap_info *info)
     return EM_OK;
 }
 
-static em_status op_snap_delete(void *user, const char *id)
+static em_status op_snap_delete(void *user, const char *id, const char *name)
 {
     snapshot *snap;
 
     (void)user;
-    snap = snap_by_id(id);
+    snap = snap_by_id(id, name);
     if (!snap)
         return EM_E_BADARG;
     free(snap->ram);

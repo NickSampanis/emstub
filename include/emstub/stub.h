@@ -43,10 +43,10 @@ typedef struct em_stub_ops {
     em_status (*write_msr)(void *user, uint16_t cpu, uint32_t index, uint64_t value);
 
     em_status (*snap_save)(void *user, const char *name, em_snap_info *saved);
-    em_status (*snap_load)(void *user, const char *id);
+    em_status (*snap_load)(void *user, const char *id, const char *name);
     uint32_t  (*snap_count)(void *user);
     em_status (*snap_info)(void *user, uint32_t index, em_snap_info *info);
-    em_status (*snap_delete)(void *user, const char *id);
+    em_status (*snap_delete)(void *user, const char *id, const char *name);
 
     uint32_t  (*monitor)(void *user, const char *cmd, uint32_t cmd_len, char *out, uint32_t cap);
 } em_stub_ops;

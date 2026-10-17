@@ -572,6 +572,21 @@ static em_status take_text(const uint8_t *req, uint32_t len, char *text, uint32_
     return EM_OK;
 }
 
+static em_status take_snap_entry(const uint8_t *req, uint32_t len, char *id, char *name)
+{
+    em_snap_entry        entry;
+
+    em_memcpy(&entry, req, sizeof entry);
+    if (entry.id_len > EM_SNAP_ID_MAX || entry.name_len > EM_SNAP_NAME_MAX ||
+        len != sizeof entry + entry.id_len + entry.name_len)
+        return EM_E_BADARG;
+    em_memcpy(id, req + sizeof entry, entry.id_len);
+    id[entry.id_len] = '\0';
+    em_memcpy(name, req + sizeof entry + entry.id_len, entry.name_len);
+    name[entry.name_len] = '\0';
+    return EM_OK;
+}
+
 static uint32_t put_snap_entry(uint8_t *out, uint32_t cap, const em_snap_info *info)
 {
     em_snap_entry        entry;
@@ -619,12 +634,13 @@ static em_status h_SNAP_SAVE(em_stub *stub, const uint8_t *req, uint32_t len)
 static em_status h_SNAP_LOAD(em_stub *stub, const uint8_t *req, uint32_t len)
 {
     char                 id[EM_SNAP_ID_MAX + 1];
+    char                 name[EM_SNAP_NAME_MAX + 1];
     em_status            status;
 
-    status = take_text(req, len, id, sizeof id);
+    status = take_snap_entry(req, len, id, name);
     if (status != EM_OK)
         return status;
-    return stub->ops->snap_load(stub->user, id);
+    return stub->ops->snap_load(stub->user, id, name);
 }
 
 static em_status h_SNAP_LIST(em_stub *stub, const uint8_t *req, uint32_t len)
@@ -657,12 +673,13 @@ static em_status h_SNAP_LIST(em_stub *stub, const uint8_t *req, uint32_t len)
 static em_status h_SNAP_DELETE(em_stub *stub, const uint8_t *req, uint32_t len)
 {
     char                 id[EM_SNAP_ID_MAX + 1];
+    char                 name[EM_SNAP_NAME_MAX + 1];
     em_status            status;
 
-    status = take_text(req, len, id, sizeof id);
+    status = take_snap_entry(req, len, id, name);
     if (status != EM_OK)
         return status;
-    return stub->ops->snap_delete(stub->user, id);
+    return stub->ops->snap_delete(stub->user, id, name);
 }
 
 static em_status h_MONITOR(em_stub *stub, const uint8_t *req, uint32_t len)
