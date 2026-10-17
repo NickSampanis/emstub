@@ -19,6 +19,8 @@ typedef enum em_kind {
     EM_KIND_EVENT = 2,
 } em_kind;
 
+#define EM_KIND_MORE      0x80u
+
 typedef enum em_status {
     EM_OK = 0,
     EM_E_UNSUPPORTED,
@@ -153,30 +155,16 @@ typedef struct em_msr {
 } em_msr;
 EM_STATIC_ASSERT(sizeof(em_msr) == 16, "em_msr layout");
 
-typedef struct em_name_req {
-    char name[64];
-} em_name_req;
-EM_STATIC_ASSERT(sizeof(em_name_req) == 64, "em_name_req layout");
+#define EM_SNAP_ID_MAX    128u
+#define EM_SNAP_NAME_MAX  256u
 
 typedef struct em_snap_entry {
-    char     name[64];
-    char     id[32];
-    uint64_t saved_at;
-    uint64_t vm_clock_ns;
-} em_snap_entry;
-EM_STATIC_ASSERT(sizeof(em_snap_entry) == 112, "em_snap_entry layout");
-
-typedef struct em_snap_list_req {
-    uint32_t first;
+    uint16_t id_len;
+    uint16_t name_len;
     uint32_t reserved;
-} em_snap_list_req;
-EM_STATIC_ASSERT(sizeof(em_snap_list_req) == 8, "em_snap_list_req layout");
-
-typedef struct em_snap_list_rep {
-    uint32_t total;
-    uint32_t count;
-} em_snap_list_rep;
-EM_STATIC_ASSERT(sizeof(em_snap_list_rep) == 8, "em_snap_list_rep layout");
+    uint64_t saved_at;
+} em_snap_entry;
+EM_STATIC_ASSERT(sizeof(em_snap_entry) == 16, "em_snap_entry layout");
 
 typedef enum em_stop_reason {
     EM_STOP_ATTACH,
@@ -215,11 +203,11 @@ EM_STATIC_ASSERT(sizeof(em_stopped) == 16, "em_stopped layout");
     X(BP_CLEAR,    0x0B, em_bp_req,         em_empty,          EM_F_RUNNING)                     \
     X(READ_MSR,    0x0C, em_msr,            em_msr,            0)                                \
     X(WRITE_MSR,   0x0D, em_msr,            em_empty,          0)                                \
-    X(SNAP_SAVE,   0x0E, em_name_req,       em_name_req,       0)                                \
-    X(SNAP_LOAD,   0x0F, em_name_req,       em_empty,          0)                                \
+    X(SNAP_SAVE,   0x0E, em_empty,          em_snap_entry,     EM_F_REQ_TAIL | EM_F_REP_TAIL)    \
+    X(SNAP_LOAD,   0x0F, em_empty,          em_empty,          EM_F_REQ_TAIL)                    \
     X(MONITOR,     0x10, em_empty,          em_empty,          EM_F_REQ_TAIL | EM_F_REP_TAIL)    \
-    X(SNAP_LIST,   0x11, em_snap_list_req,  em_snap_list_rep,  EM_F_REP_TAIL | EM_F_RUNNING)     \
-    X(SNAP_DELETE, 0x12, em_name_req,       em_empty,          EM_F_RUNNING)
+    X(SNAP_LIST,   0x11, em_empty,          em_empty,          EM_F_REP_TAIL | EM_F_RUNNING)     \
+    X(SNAP_DELETE, 0x12, em_empty,          em_empty,          EM_F_REQ_TAIL | EM_F_RUNNING)
 
 #define EM_EVENTS(X)                                                                             \
     X(STOPPED,    0x81, em_stopped,      EM_F_REP_TAIL)                                          \

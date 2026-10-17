@@ -65,7 +65,7 @@ static void sleep_ms(unsigned ms)
 #define DATA_ADDR    0x402000ull
 #define FLAG_ZF      (1ull << 6)
 #define MAX_BPS      16
-#define MAX_SNAPS    8
+#define MAX_SNAPS    32
 
 static uint8_t     ram[RAM_SIZE];
 static em_x86_core core;
@@ -76,7 +76,7 @@ static uint64_t    executed;
 
 /* Snapshots live outside the machine, so they survive reset_machine() and reconnects. */
 typedef struct snapshot {
-    char        name[64];
+    char        name[EM_SNAP_NAME_MAX + 1];
     uint32_t    id;
     uint64_t    saved_at;
     uint64_t    executed;
@@ -404,7 +404,7 @@ static uint32_t op_monitor(void *user, const char *cmd, uint32_t cmd_len, char *
     return n < 0 ? 0 : ((uint32_t)n < cap ? (uint32_t)n : cap);
 }
 
-static snapshot *snap_find(const char *name)
+static snapshot *snap_by_name(const char *name)
 {
     uint32_t index;
 
@@ -414,10 +414,31 @@ static snapshot *snap_find(const char *name)
     return NULL;
 }
 
-static em_status op_snap_save(void *user, const char *name, char *saved_name, uint32_t cap)
+static snapshot *snap_by_id(const char *id)
+{
+    char     text[16];
+    uint32_t index;
+
+    for (index = 0; index < snap_count; index++) {
+        snprintf(text, sizeof text, "%u", snaps[index].id);
+        if (!strcmp(text, id))
+            return &snaps[index];
+    }
+    return NULL;
+}
+
+static void snap_describe(const snapshot *snap, em_snap_info *info)
+{
+    snprintf(info->id, sizeof info->id, "%u", snap->id);
+    snprintf(info->name, sizeof info->name, "%s", snap->name);
+    info->saved_at = snap->saved_at;
+}
+
+/* Like QEMU's savevm: a name that already exists is replaced by a new snapshot with a new id. */
+static em_status op_snap_save(void *user, const char *name, em_snap_info *saved)
 {
     snapshot *snap;
-    char      auto_name[sizeof snaps[0].name];
+    char      auto_name[32];
     uint32_t  number;
 
     (void)user;
@@ -426,12 +447,10 @@ static em_status op_snap_save(void *user, const char *name, char *saved_name, ui
         do {
             number++;
             snprintf(auto_name, sizeof auto_name, "snap-%u", number);
-        } while (snap_find(auto_name));
+        } while (snap_by_name(auto_name));
         name = auto_name;
     }
-    if (strlen(name) >= sizeof snap->name)
-        return EM_E_BADARG;
-    snap = snap_find(name);
+    snap = snap_by_name(name);
     if (!snap) {
         if (snap_count == MAX_SNAPS)
             return EM_E_BADARG;
@@ -450,16 +469,16 @@ static em_status op_snap_save(void *user, const char *name, char *saved_name, ui
     snap->core = core;
     snap->segs = segs;
     snap->ctrl = ctrl;
-    snprintf(saved_name, cap, "%s", snap->name);
+    snap_describe(snap, saved);
     return EM_OK;
 }
 
-static em_status op_snap_load(void *user, const char *name)
+static em_status op_snap_load(void *user, const char *id)
 {
     snapshot *snap;
 
     (void)user;
-    snap = snap_find(name);
+    snap = snap_by_id(id);
     if (!snap)
         return EM_E_BADARG;
     memcpy(ram, snap->ram, RAM_SIZE);
@@ -470,25 +489,27 @@ static em_status op_snap_load(void *user, const char *name)
     return EM_OK;
 }
 
-static em_status op_snap_list(void *user, uint32_t index, em_snap_entry *entry, uint32_t *total)
+static uint32_t op_snap_count(void *user)
 {
     (void)user;
-    *total = snap_count;
+    return snap_count;
+}
+
+static em_status op_snap_info(void *user, uint32_t index, em_snap_info *info)
+{
+    (void)user;
     if (index >= snap_count)
-        return EM_OK;
-    snprintf(entry->name, sizeof entry->name, "%s", snaps[index].name);
-    snprintf(entry->id, sizeof entry->id, "%u", snaps[index].id);
-    entry->saved_at = snaps[index].saved_at;
-    entry->vm_clock_ns = snaps[index].executed * 1000u;  /* about 1 us per instruction */
+        return EM_E_BADARG;
+    snap_describe(&snaps[index], info);
     return EM_OK;
 }
 
-static em_status op_snap_delete(void *user, const char *name)
+static em_status op_snap_delete(void *user, const char *id)
 {
     snapshot *snap;
 
     (void)user;
-    snap = snap_find(name);
+    snap = snap_by_id(id);
     if (!snap)
         return EM_E_BADARG;
     free(snap->ram);
@@ -505,7 +526,7 @@ static const em_stub_ops ops = {
     NULL,                         /* translate: same */
     op_bp_set, op_bp_clear,
     NULL, NULL,                   /* msr */
-    op_snap_save, op_snap_load, op_snap_list, op_snap_delete,
+    op_snap_save, op_snap_load, op_snap_count, op_snap_info, op_snap_delete,
     op_monitor,
 };
 

@@ -15,6 +15,12 @@ extern "C" {
 #define EM_STUB_MAX_PAYLOAD 4096u
 #endif
 
+typedef struct em_snap_info {
+    char     id[EM_SNAP_ID_MAX + 1];
+    char     name[EM_SNAP_NAME_MAX + 1];
+    uint64_t saved_at;
+} em_snap_info;
+
 typedef struct em_stub_ops {
     int32_t   (*send)(void *user, const void *buf, uint32_t len);
     int32_t   (*recv)(void *user, void *buf, uint32_t len, int block);
@@ -36,10 +42,11 @@ typedef struct em_stub_ops {
     em_status (*read_msr)(void *user, uint16_t cpu, uint32_t index, uint64_t *value);
     em_status (*write_msr)(void *user, uint16_t cpu, uint32_t index, uint64_t value);
 
-    em_status (*snap_save)(void *user, const char *name, char *saved_name, uint32_t cap);
-    em_status (*snap_load)(void *user, const char *name);
-    em_status (*snap_list)(void *user, uint32_t index, em_snap_entry *entry, uint32_t *total);
-    em_status (*snap_delete)(void *user, const char *name);
+    em_status (*snap_save)(void *user, const char *name, em_snap_info *saved);
+    em_status (*snap_load)(void *user, const char *id);
+    uint32_t  (*snap_count)(void *user);
+    em_status (*snap_info)(void *user, uint32_t index, em_snap_info *info);
+    em_status (*snap_delete)(void *user, const char *id);
 
     uint32_t  (*monitor)(void *user, const char *cmd, uint32_t cmd_len, char *out, uint32_t cap);
 } em_stub_ops;
@@ -81,6 +88,9 @@ typedef struct em_stub {
 
     uint8_t            resume_set;
     em_resume          resume;
+
+    uint16_t           req_type;
+    uint32_t           req_seq;
 
     uint32_t           rx_have;
     uint32_t           tx_len;

@@ -44,14 +44,14 @@ static uint32_t tx_cap(const em_stub *stub)
     return em_min(EM_STUB_MAX_PAYLOAD, stub->peer_max);
 }
 
-static int send_packet(em_stub *stub, uint16_t type, em_kind kind, em_status status, uint32_t seq,
+static int send_packet(em_stub *stub, uint16_t type, uint8_t kind, em_status status, uint32_t seq,
                        uint32_t len)
 {
     em_hdr               header;
 
     header.magic  = EM_MAGIC;
     header.type   = type;
-    header.kind   = (uint8_t)kind;
+    header.kind   = kind;
     header.status = (uint8_t)status;
     header.seq    = seq;
     header.len    = len;
@@ -552,78 +552,117 @@ static em_status h_WRITE_MSR(em_stub *stub, const uint8_t *req, uint32_t len)
     return stub->ops->write_msr(stub->user, msr.cpu, msr.index, msr.value);
 }
 
+static uint32_t text_len(const char *text, uint32_t max)
+{
+    uint32_t             len;
+
+    len = 0;
+    while (len < max && text[len])
+        len++;
+    return len;
+}
+
+static em_status take_text(const uint8_t *req, uint32_t len, char *text, uint32_t cap)
+{
+    if (len < sizeof(em_empty) || len - sizeof(em_empty) >= cap)
+        return EM_E_BADARG;
+    len -= (uint32_t)sizeof(em_empty);
+    em_memcpy(text, req + sizeof(em_empty), len);
+    text[len] = '\0';
+    return EM_OK;
+}
+
+static uint32_t put_snap_entry(uint8_t *out, uint32_t cap, const em_snap_info *info)
+{
+    em_snap_entry        entry;
+    uint32_t             size;
+
+    entry.id_len   = (uint16_t)text_len(info->id, EM_SNAP_ID_MAX);
+    entry.name_len = (uint16_t)text_len(info->name, EM_SNAP_NAME_MAX);
+    entry.reserved = 0;
+    entry.saved_at = info->saved_at;
+    size = (uint32_t)sizeof entry + entry.id_len + entry.name_len;
+    if (size > cap)
+        return 0;
+    em_memcpy(out, &entry, sizeof entry);
+    em_memcpy(out + sizeof entry, info->id, entry.id_len);
+    em_memcpy(out + sizeof entry + entry.id_len, info->name, entry.name_len);
+    return size;
+}
+
+static int send_more(em_stub *stub)
+{
+    if (send_packet(stub, stub->req_type, EM_KIND_REPLY | EM_KIND_MORE, EM_OK, stub->req_seq,
+                    stub->tx_len) < 0)
+        return -1;
+    stub->tx_len = 0;
+    return 0;
+}
+
 static em_status h_SNAP_SAVE(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_name_req          name_req;
-    em_name_req          saved_name;
+    char                 name[EM_SNAP_NAME_MAX + 1];
+    em_snap_info         saved;
     em_status            status;
 
-    (void)len;
-    em_memcpy(&name_req, req, sizeof name_req);
-    name_req.name[sizeof name_req.name - 1] = '\0';
-    em_memset(&saved_name, 0, sizeof saved_name);
-    status = stub->ops->snap_save(stub->user, name_req.name, saved_name.name,
-                                  sizeof saved_name.name);
+    status = take_text(req, len, name, sizeof name);
     if (status != EM_OK)
         return status;
-    saved_name.name[sizeof saved_name.name - 1] = '\0';
-    if (!saved_name.name[0])
-        em_memcpy(&saved_name, &name_req, sizeof saved_name);
-    reply(stub, &saved_name, sizeof saved_name);
+    em_memset(&saved, 0, sizeof saved);
+    status = stub->ops->snap_save(stub->user, name, &saved);
+    if (status != EM_OK)
+        return status;
+    stub->tx_len = put_snap_entry(TX_PAYLOAD(stub), tx_cap(stub), &saved);
     return EM_OK;
 }
 
 static em_status h_SNAP_LOAD(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_name_req          name_req;
+    char                 id[EM_SNAP_ID_MAX + 1];
+    em_status            status;
 
-    (void)len;
-    em_memcpy(&name_req, req, sizeof name_req);
-    name_req.name[sizeof name_req.name - 1] = '\0';
-    return stub->ops->snap_load(stub->user, name_req.name);
+    status = take_text(req, len, id, sizeof id);
+    if (status != EM_OK)
+        return status;
+    return stub->ops->snap_load(stub->user, id);
 }
 
 static em_status h_SNAP_LIST(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_snap_list_req     list_req;
-    em_snap_list_rep     list_rep;
-    em_snap_entry        entry;
-    uint32_t             max_entries;
-    uint32_t             total;
+    em_snap_info         info;
+    uint32_t             count;
+    uint32_t             index;
+    uint32_t             size;
     em_status            status;
 
+    (void)req;
     (void)len;
-    em_memcpy(&list_req, req, sizeof list_req);
-    em_memset(&list_rep, 0, sizeof list_rep);
-    max_entries = (tx_cap(stub) - (uint32_t)sizeof list_rep) / (uint32_t)sizeof entry;
-    for (;;) {
-        em_memset(&entry, 0, sizeof entry);
-        total = 0;
-        status = stub->ops->snap_list(stub->user, list_req.first + list_rep.count, &entry, &total);
+    count = stub->ops->snap_count(stub->user);
+    for (index = 0; index < count; index++) {
+        em_memset(&info, 0, sizeof info);
+        status = stub->ops->snap_info(stub->user, index, &info);
         if (status != EM_OK)
             return status;
-        list_rep.total = total;
-        if (list_req.first + list_rep.count >= total || list_rep.count == max_entries)
-            break;
-        entry.name[sizeof entry.name - 1] = '\0';
-        entry.id[sizeof entry.id - 1] = '\0';
-        em_memcpy(TX_PAYLOAD(stub) + sizeof list_rep + list_rep.count * sizeof entry, &entry,
-                  sizeof entry);
-        list_rep.count++;
+        size = put_snap_entry(TX_PAYLOAD(stub) + stub->tx_len, tx_cap(stub) - stub->tx_len, &info);
+        if (!size) {
+            if (send_more(stub) < 0)
+                return EM_E_FAULT;
+            size = put_snap_entry(TX_PAYLOAD(stub), tx_cap(stub), &info);
+        }
+        stub->tx_len += size;
     }
-    em_memcpy(TX_PAYLOAD(stub), &list_rep, sizeof list_rep);
-    stub->tx_len = (uint32_t)sizeof list_rep + list_rep.count * (uint32_t)sizeof entry;
     return EM_OK;
 }
 
 static em_status h_SNAP_DELETE(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_name_req          name_req;
+    char                 id[EM_SNAP_ID_MAX + 1];
+    em_status            status;
 
-    (void)len;
-    em_memcpy(&name_req, req, sizeof name_req);
-    name_req.name[sizeof name_req.name - 1] = '\0';
-    return stub->ops->snap_delete(stub->user, name_req.name);
+    status = take_text(req, len, id, sizeof id);
+    if (status != EM_OK)
+        return status;
+    return stub->ops->snap_delete(stub->user, id);
 }
 
 static em_status h_MONITOR(em_stub *stub, const uint8_t *req, uint32_t len)
@@ -678,7 +717,7 @@ static void compute_commands(em_stub *stub)
         set_command(stub, EM_CMD_SNAP_SAVE);
     if (ops->snap_load)
         set_command(stub, EM_CMD_SNAP_LOAD);
-    if (ops->snap_list)
+    if (ops->snap_count && ops->snap_info)
         set_command(stub, EM_CMD_SNAP_LIST);
     if (ops->snap_delete)
         set_command(stub, EM_CMD_SNAP_DELETE);
@@ -699,6 +738,8 @@ static void handle_packet(em_stub *stub)
     type_flags = em_type_flags(header.type);
     fixed_size = em_req_size(header.type);
     stub->tx_len = 0;
+    stub->req_type = header.type;
+    stub->req_seq = header.seq;
 
     if (!handler || !command_supported(stub, header.type))
         status = EM_E_UNSUPPORTED;
