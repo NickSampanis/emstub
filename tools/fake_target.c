@@ -24,6 +24,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -64,6 +65,7 @@ static void sleep_ms(unsigned ms)
 #define DATA_ADDR    0x402000ull
 #define FLAG_ZF      (1ull << 6)
 #define MAX_BPS      16
+#define MAX_SNAPS    8
 
 static uint8_t     ram[RAM_SIZE];
 static em_x86_core core;
@@ -71,6 +73,22 @@ static em_x86_segs segs;
 static em_x86_ctrl ctrl;
 static uint64_t    bps[MAX_BPS];          /* 0 = free slot; id = index + 1 */
 static uint64_t    executed;
+
+/* Snapshots live outside the machine, so they survive reset_machine() and reconnects. */
+typedef struct snapshot {
+    char        name[64];
+    uint32_t    id;
+    uint64_t    saved_at;
+    uint64_t    executed;
+    uint8_t    *ram;
+    em_x86_core core;
+    em_x86_segs segs;
+    em_x86_ctrl ctrl;
+} snapshot;
+
+static snapshot    snaps[MAX_SNAPS];
+static uint32_t    snap_count;
+static uint32_t    snap_next_id;
 
 static const uint8_t program[] = {
     /* 0x401000 checksum */
@@ -386,6 +404,99 @@ static uint32_t op_monitor(void *user, const char *cmd, uint32_t cmd_len, char *
     return n < 0 ? 0 : ((uint32_t)n < cap ? (uint32_t)n : cap);
 }
 
+static snapshot *snap_find(const char *name)
+{
+    uint32_t index;
+
+    for (index = 0; index < snap_count; index++)
+        if (!strcmp(snaps[index].name, name))
+            return &snaps[index];
+    return NULL;
+}
+
+static em_status op_snap_save(void *user, const char *name, char *saved_name, uint32_t cap)
+{
+    snapshot *snap;
+    char      auto_name[sizeof snaps[0].name];
+    uint32_t  number;
+
+    (void)user;
+    if (!name[0]) {
+        number = snap_next_id;
+        do {
+            number++;
+            snprintf(auto_name, sizeof auto_name, "snap-%u", number);
+        } while (snap_find(auto_name));
+        name = auto_name;
+    }
+    if (strlen(name) >= sizeof snap->name)
+        return EM_E_BADARG;
+    snap = snap_find(name);
+    if (!snap) {
+        if (snap_count == MAX_SNAPS)
+            return EM_E_BADARG;
+        snap = &snaps[snap_count];
+        memset(snap, 0, sizeof *snap);
+        snap->ram = malloc(RAM_SIZE);
+        if (!snap->ram)
+            return EM_E_FAULT;
+        snap_count++;
+    }
+    snprintf(snap->name, sizeof snap->name, "%s", name);
+    snap->id = ++snap_next_id;
+    snap->saved_at = (uint64_t)time(NULL);
+    snap->executed = executed;
+    memcpy(snap->ram, ram, RAM_SIZE);
+    snap->core = core;
+    snap->segs = segs;
+    snap->ctrl = ctrl;
+    snprintf(saved_name, cap, "%s", snap->name);
+    return EM_OK;
+}
+
+static em_status op_snap_load(void *user, const char *name)
+{
+    snapshot *snap;
+
+    (void)user;
+    snap = snap_find(name);
+    if (!snap)
+        return EM_E_BADARG;
+    memcpy(ram, snap->ram, RAM_SIZE);
+    core = snap->core;
+    segs = snap->segs;
+    ctrl = snap->ctrl;
+    executed = snap->executed;
+    return EM_OK;
+}
+
+static em_status op_snap_list(void *user, uint32_t index, em_snap_entry *entry, uint32_t *total)
+{
+    (void)user;
+    *total = snap_count;
+    if (index >= snap_count)
+        return EM_OK;
+    snprintf(entry->name, sizeof entry->name, "%s", snaps[index].name);
+    snprintf(entry->id, sizeof entry->id, "%u", snaps[index].id);
+    entry->saved_at = snaps[index].saved_at;
+    entry->vm_clock_ns = snaps[index].executed * 1000u;  /* about 1 us per instruction */
+    return EM_OK;
+}
+
+static em_status op_snap_delete(void *user, const char *name)
+{
+    snapshot *snap;
+
+    (void)user;
+    snap = snap_find(name);
+    if (!snap)
+        return EM_E_BADARG;
+    free(snap->ram);
+    memmove(snap, snap + 1, (size_t)(&snaps[snap_count] - (snap + 1)) * sizeof *snap);
+    snap_count--;
+    return EM_OK;
+}
+
 static const em_stub_ops ops = {
     op_send, op_recv,
     op_read_phys, op_write_phys,
@@ -394,7 +505,7 @@ static const em_stub_ops ops = {
     NULL,                         /* translate: same */
     op_bp_set, op_bp_clear,
     NULL, NULL,                   /* msr */
-    NULL, NULL,                   /* snapshots */
+    op_snap_save, op_snap_load, op_snap_list, op_snap_delete,
     op_monitor,
 };
 

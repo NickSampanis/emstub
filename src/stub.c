@@ -555,11 +555,22 @@ static em_status h_WRITE_MSR(em_stub *stub, const uint8_t *req, uint32_t len)
 static em_status h_SNAP_SAVE(em_stub *stub, const uint8_t *req, uint32_t len)
 {
     em_name_req          name_req;
+    em_name_req          saved_name;
+    em_status            status;
 
     (void)len;
     em_memcpy(&name_req, req, sizeof name_req);
     name_req.name[sizeof name_req.name - 1] = '\0';
-    return stub->ops->snap_save(stub->user, name_req.name);
+    em_memset(&saved_name, 0, sizeof saved_name);
+    status = stub->ops->snap_save(stub->user, name_req.name, saved_name.name,
+                                  sizeof saved_name.name);
+    if (status != EM_OK)
+        return status;
+    saved_name.name[sizeof saved_name.name - 1] = '\0';
+    if (!saved_name.name[0])
+        em_memcpy(&saved_name, &name_req, sizeof saved_name);
+    reply(stub, &saved_name, sizeof saved_name);
+    return EM_OK;
 }
 
 static em_status h_SNAP_LOAD(em_stub *stub, const uint8_t *req, uint32_t len)
@@ -570,6 +581,49 @@ static em_status h_SNAP_LOAD(em_stub *stub, const uint8_t *req, uint32_t len)
     em_memcpy(&name_req, req, sizeof name_req);
     name_req.name[sizeof name_req.name - 1] = '\0';
     return stub->ops->snap_load(stub->user, name_req.name);
+}
+
+static em_status h_SNAP_LIST(em_stub *stub, const uint8_t *req, uint32_t len)
+{
+    em_snap_list_req     list_req;
+    em_snap_list_rep     list_rep;
+    em_snap_entry        entry;
+    uint32_t             max_entries;
+    uint32_t             total;
+    em_status            status;
+
+    (void)len;
+    em_memcpy(&list_req, req, sizeof list_req);
+    em_memset(&list_rep, 0, sizeof list_rep);
+    max_entries = (tx_cap(stub) - (uint32_t)sizeof list_rep) / (uint32_t)sizeof entry;
+    for (;;) {
+        em_memset(&entry, 0, sizeof entry);
+        total = 0;
+        status = stub->ops->snap_list(stub->user, list_req.first + list_rep.count, &entry, &total);
+        if (status != EM_OK)
+            return status;
+        list_rep.total = total;
+        if (list_req.first + list_rep.count >= total || list_rep.count == max_entries)
+            break;
+        entry.name[sizeof entry.name - 1] = '\0';
+        entry.id[sizeof entry.id - 1] = '\0';
+        em_memcpy(TX_PAYLOAD(stub) + sizeof list_rep + list_rep.count * sizeof entry, &entry,
+                  sizeof entry);
+        list_rep.count++;
+    }
+    em_memcpy(TX_PAYLOAD(stub), &list_rep, sizeof list_rep);
+    stub->tx_len = (uint32_t)sizeof list_rep + list_rep.count * (uint32_t)sizeof entry;
+    return EM_OK;
+}
+
+static em_status h_SNAP_DELETE(em_stub *stub, const uint8_t *req, uint32_t len)
+{
+    em_name_req          name_req;
+
+    (void)len;
+    em_memcpy(&name_req, req, sizeof name_req);
+    name_req.name[sizeof name_req.name - 1] = '\0';
+    return stub->ops->snap_delete(stub->user, name_req.name);
 }
 
 static em_status h_MONITOR(em_stub *stub, const uint8_t *req, uint32_t len)
@@ -624,6 +678,10 @@ static void compute_commands(em_stub *stub)
         set_command(stub, EM_CMD_SNAP_SAVE);
     if (ops->snap_load)
         set_command(stub, EM_CMD_SNAP_LOAD);
+    if (ops->snap_list)
+        set_command(stub, EM_CMD_SNAP_LIST);
+    if (ops->snap_delete)
+        set_command(stub, EM_CMD_SNAP_DELETE);
     if (ops->monitor)
         set_command(stub, EM_CMD_MONITOR);
 }
