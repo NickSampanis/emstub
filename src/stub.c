@@ -562,16 +562,6 @@ static uint32_t text_len(const char *text, uint32_t max)
     return len;
 }
 
-static em_status take_text(const uint8_t *req, uint32_t len, char *text, uint32_t cap)
-{
-    if (len < sizeof(em_empty) || len - sizeof(em_empty) >= cap)
-        return EM_E_BADARG;
-    len -= (uint32_t)sizeof(em_empty);
-    em_memcpy(text, req + sizeof(em_empty), len);
-    text[len] = '\0';
-    return EM_OK;
-}
-
 static em_status take_snap_entry(const uint8_t *req, uint32_t len, char *id, char *name)
 {
     em_snap_hdr          hdr;
@@ -616,15 +606,16 @@ static int send_more(em_stub *stub)
 
 static em_status h_SNAP_SAVE(em_stub *stub, const uint8_t *req, uint32_t len)
 {
+    char                 id[EM_SNAP_ID_MAX + 1];
     char                 name[EM_SNAP_NAME_MAX + 1];
     em_snap_entry        saved;
     em_status            status;
 
-    status = take_text(req, len, name, sizeof name);
+    status = take_snap_entry(req, len, id, name);
     if (status != EM_OK)
         return status;
     em_memset(&saved, 0, sizeof saved);
-    status = stub->ops->snap_save(stub->user, name, &saved);
+    status = stub->ops->snap_save(stub->user, id, name, &saved);
     if (status != EM_OK)
         return status;
     stub->tx_len = put_snap_entry(TX_PAYLOAD(stub), tx_cap(stub), &saved);

@@ -414,17 +414,27 @@ static snapshot *snap_by_name(const char *name)
     return NULL;
 }
 
-static snapshot *snap_by_id(const char *id, const char *name)
+static snapshot *snap_by_id(const char *id)
 {
     char     text[16];
     uint32_t index;
 
     for (index = 0; index < snap_count; index++) {
         snprintf(text, sizeof text, "%u", snaps[index].id);
-        if (!strcmp(text, id) && !strcmp(snaps[index].name, name))
+        if (!strcmp(text, id))
             return &snaps[index];
     }
     return NULL;
+}
+
+static snapshot *snap_by_entry(const char *id, const char *name)
+{
+    snapshot *snap;
+
+    snap = snap_by_id(id);
+    if (!snap || strcmp(snap->name, name))
+        return NULL;
+    return snap;
 }
 
 static void snap_describe(const snapshot *snap, em_snap_entry *info)
@@ -434,14 +444,30 @@ static void snap_describe(const snapshot *snap, em_snap_entry *info)
     info->saved_at = snap->saved_at;
 }
 
-/* Saving to a name that already exists updates that snapshot in place; its id stays. */
-static em_status op_snap_save(void *user, const char *name, em_snap_entry *saved)
+/* With an id, that snapshot is updated in place (renamed too when the name differs); an unknown
+   id is an error. Without one, a name that already exists is updated, otherwise a new snapshot is
+   made. An update keeps the snapshot's id. */
+static em_status op_snap_save(void *user, const char *id, const char *name,
+                              em_snap_entry *save_entry)
 {
     snapshot *snap;
+    snapshot *named;
     char      auto_name[32];
     uint32_t  number;
 
     (void)user;
+    if (id[0]) {
+        snap = snap_by_id(id);
+        if (!snap)
+            return EM_E_BADARG;
+        if (name[0]) {
+            named = snap_by_name(name);
+            if (named && named != snap)
+                return EM_E_BADARG;
+            snprintf(snap->name, sizeof snap->name, "%s", name);
+        }
+        name = snap->name;
+    }
     if (!name[0]) {
         number = snap_next_id;
         do {
@@ -469,7 +495,7 @@ static em_status op_snap_save(void *user, const char *name, em_snap_entry *saved
     snap->core = core;
     snap->segs = segs;
     snap->ctrl = ctrl;
-    snap_describe(snap, saved);
+    snap_describe(snap, save_entry);
     return EM_OK;
 }
 
@@ -478,7 +504,7 @@ static em_status op_snap_load(void *user, const char *id, const char *name)
     snapshot *snap;
 
     (void)user;
-    snap = snap_by_id(id, name);
+    snap = snap_by_entry(id, name);
     if (!snap)
         return EM_E_BADARG;
     memcpy(ram, snap->ram, RAM_SIZE);
@@ -510,7 +536,7 @@ static em_status op_snap_delete(void *user, const char *id, const char *name)
     snapshot *snap;
 
     (void)user;
-    snap = snap_by_id(id, name);
+    snap = snap_by_entry(id, name);
     if (!snap)
         return EM_E_BADARG;
     free(snap->ram);

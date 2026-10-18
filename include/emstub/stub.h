@@ -44,7 +44,7 @@ typedef struct em_stub_ops {
     em_status (*read_msr)(void *user, uint16_t cpu, uint32_t index, uint64_t *value);
     em_status (*write_msr)(void *user, uint16_t cpu, uint32_t index, uint64_t value);
 
-    em_status (*snap_save)(void *user, const char *name, em_snap_entry *saved);
+    em_status (*snap_save)(void *user, const char *id, const char *name, em_snap_entry *save_entry);
     em_status (*snap_load)(void *user, const char *id, const char *name);
     em_status (*snap_list)(void *user, em_snap_emit emit, void *ctx);
     em_status (*snap_delete)(void *user, const char *id, const char *name);
