@@ -574,34 +574,34 @@ static em_status take_text(const uint8_t *req, uint32_t len, char *text, uint32_
 
 static em_status take_snap_entry(const uint8_t *req, uint32_t len, char *id, char *name)
 {
-    em_snap_entry        entry;
+    em_snap_hdr          hdr;
 
-    em_memcpy(&entry, req, sizeof entry);
-    if (entry.id_len > EM_SNAP_ID_MAX || entry.name_len > EM_SNAP_NAME_MAX ||
-        len != sizeof entry + entry.id_len + entry.name_len)
+    em_memcpy(&hdr, req, sizeof hdr);
+    if (hdr.id_len > EM_SNAP_ID_MAX || hdr.name_len > EM_SNAP_NAME_MAX ||
+        len != sizeof hdr + hdr.id_len + hdr.name_len)
         return EM_E_BADARG;
-    em_memcpy(id, req + sizeof entry, entry.id_len);
-    id[entry.id_len] = '\0';
-    em_memcpy(name, req + sizeof entry + entry.id_len, entry.name_len);
-    name[entry.name_len] = '\0';
+    em_memcpy(id, req + sizeof hdr, hdr.id_len);
+    id[hdr.id_len] = '\0';
+    em_memcpy(name, req + sizeof hdr + hdr.id_len, hdr.name_len);
+    name[hdr.name_len] = '\0';
     return EM_OK;
 }
 
-static uint32_t put_snap_entry(uint8_t *out, uint32_t cap, const em_snap_info *info)
+static uint32_t put_snap_entry(uint8_t *out, uint32_t cap, const em_snap_entry *snap_entry)
 {
-    em_snap_entry        entry;
+    em_snap_hdr          hdr;
     uint32_t             size;
 
-    entry.id_len   = (uint16_t)text_len(info->id, EM_SNAP_ID_MAX);
-    entry.name_len = (uint16_t)text_len(info->name, EM_SNAP_NAME_MAX);
-    entry.reserved = 0;
-    entry.saved_at = info->saved_at;
-    size = (uint32_t)sizeof entry + entry.id_len + entry.name_len;
+    hdr.id_len   = (uint16_t)text_len(snap_entry->id, EM_SNAP_ID_MAX);
+    hdr.name_len = (uint16_t)text_len(snap_entry->name, EM_SNAP_NAME_MAX);
+    hdr.reserved = 0;
+    hdr.saved_at = snap_entry->saved_at;
+    size = (uint32_t)sizeof hdr + hdr.id_len + hdr.name_len;
     if (size > cap)
         return 0;
-    em_memcpy(out, &entry, sizeof entry);
-    em_memcpy(out + sizeof entry, info->id, entry.id_len);
-    em_memcpy(out + sizeof entry + entry.id_len, info->name, entry.name_len);
+    em_memcpy(out, &hdr, sizeof hdr);
+    em_memcpy(out + sizeof hdr, snap_entry->id, hdr.id_len);
+    em_memcpy(out + sizeof hdr + hdr.id_len, snap_entry->name, hdr.name_len);
     return size;
 }
 
@@ -617,7 +617,7 @@ static int send_more(em_stub *stub)
 static em_status h_SNAP_SAVE(em_stub *stub, const uint8_t *req, uint32_t len)
 {
     char                 name[EM_SNAP_NAME_MAX + 1];
-    em_snap_info         saved;
+    em_snap_entry        saved;
     em_status            status;
 
     status = take_text(req, len, name, sizeof name);
@@ -643,31 +643,28 @@ static em_status h_SNAP_LOAD(em_stub *stub, const uint8_t *req, uint32_t len)
     return stub->ops->snap_load(stub->user, id, name);
 }
 
+static em_status emit_snap(void *ctx, const em_snap_entry *snap_entry)
+{
+    em_stub              *stub;
+    uint32_t             size;
+
+    stub = (em_stub *)ctx;
+    size = put_snap_entry(TX_PAYLOAD(stub) + stub->tx_len, tx_cap(stub) - stub->tx_len,
+                          snap_entry);
+    if (!size) {
+        if (send_more(stub) < 0)
+            return EM_E_FAULT;
+        size = put_snap_entry(TX_PAYLOAD(stub), tx_cap(stub), snap_entry);
+    }
+    stub->tx_len += size;
+    return EM_OK;
+}
+
 static em_status h_SNAP_LIST(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    em_snap_info         info;
-    uint32_t             count;
-    uint32_t             index;
-    uint32_t             size;
-    em_status            status;
-
     (void)req;
     (void)len;
-    count = stub->ops->snap_count(stub->user);
-    for (index = 0; index < count; index++) {
-        em_memset(&info, 0, sizeof info);
-        status = stub->ops->snap_info(stub->user, index, &info);
-        if (status != EM_OK)
-            return status;
-        size = put_snap_entry(TX_PAYLOAD(stub) + stub->tx_len, tx_cap(stub) - stub->tx_len, &info);
-        if (!size) {
-            if (send_more(stub) < 0)
-                return EM_E_FAULT;
-            size = put_snap_entry(TX_PAYLOAD(stub), tx_cap(stub), &info);
-        }
-        stub->tx_len += size;
-    }
-    return EM_OK;
+    return stub->ops->snap_list(stub->user, emit_snap, stub);
 }
 
 static em_status h_SNAP_DELETE(em_stub *stub, const uint8_t *req, uint32_t len)
@@ -734,7 +731,7 @@ static void compute_commands(em_stub *stub)
         set_command(stub, EM_CMD_SNAP_SAVE);
     if (ops->snap_load)
         set_command(stub, EM_CMD_SNAP_LOAD);
-    if (ops->snap_count && ops->snap_info)
+    if (ops->snap_list)
         set_command(stub, EM_CMD_SNAP_LIST);
     if (ops->snap_delete)
         set_command(stub, EM_CMD_SNAP_DELETE);

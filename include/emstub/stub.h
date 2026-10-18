@@ -15,11 +15,13 @@ extern "C" {
 #define EM_STUB_MAX_PAYLOAD 4096u
 #endif
 
-typedef struct em_snap_info {
+typedef struct em_snap_entry {
     char     id[EM_SNAP_ID_MAX + 1];
     char     name[EM_SNAP_NAME_MAX + 1];
     uint64_t saved_at;
-} em_snap_info;
+} em_snap_entry;
+
+typedef em_status (*em_snap_emit)(void *ctx, const em_snap_entry *snap_entry);
 
 typedef struct em_stub_ops {
     int32_t   (*send)(void *user, const void *buf, uint32_t len);
@@ -42,10 +44,9 @@ typedef struct em_stub_ops {
     em_status (*read_msr)(void *user, uint16_t cpu, uint32_t index, uint64_t *value);
     em_status (*write_msr)(void *user, uint16_t cpu, uint32_t index, uint64_t value);
 
-    em_status (*snap_save)(void *user, const char *name, em_snap_info *saved);
+    em_status (*snap_save)(void *user, const char *name, em_snap_entry *saved);
     em_status (*snap_load)(void *user, const char *id, const char *name);
-    uint32_t  (*snap_count)(void *user);
-    em_status (*snap_info)(void *user, uint32_t index, em_snap_info *info);
+    em_status (*snap_list)(void *user, em_snap_emit emit, void *ctx);
     em_status (*snap_delete)(void *user, const char *id, const char *name);
 
     uint32_t  (*monitor)(void *user, const char *cmd, uint32_t cmd_len, char *out, uint32_t cap);

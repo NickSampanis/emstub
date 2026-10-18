@@ -158,13 +158,13 @@ EM_STATIC_ASSERT(sizeof(em_msr) == 16, "em_msr layout");
 #define EM_SNAP_ID_MAX    128u
 #define EM_SNAP_NAME_MAX  256u
 
-typedef struct em_snap_entry {
+typedef struct em_snap_hdr {
     uint16_t id_len;
     uint16_t name_len;
     uint32_t reserved;
     uint64_t saved_at;
-} em_snap_entry;
-EM_STATIC_ASSERT(sizeof(em_snap_entry) == 16, "em_snap_entry layout");
+} em_snap_hdr;
+EM_STATIC_ASSERT(sizeof(em_snap_hdr) == 16, "em_snap_hdr layout");
 
 typedef enum em_stop_reason {
     EM_STOP_ATTACH,
@@ -203,11 +203,11 @@ EM_STATIC_ASSERT(sizeof(em_stopped) == 16, "em_stopped layout");
     X(BP_CLEAR,    0x0B, em_bp_req,         em_empty,          EM_F_RUNNING)                     \
     X(READ_MSR,    0x0C, em_msr,            em_msr,            0)                                \
     X(WRITE_MSR,   0x0D, em_msr,            em_empty,          0)                                \
-    X(SNAP_SAVE,   0x0E, em_empty,          em_snap_entry,     EM_F_REQ_TAIL | EM_F_REP_TAIL)    \
-    X(SNAP_LOAD,   0x0F, em_snap_entry,     em_empty,          EM_F_REQ_TAIL)                    \
+    X(SNAP_SAVE,   0x0E, em_empty,          em_snap_hdr,       EM_F_REQ_TAIL | EM_F_REP_TAIL)    \
+    X(SNAP_LOAD,   0x0F, em_snap_hdr,       em_empty,          EM_F_REQ_TAIL)                    \
     X(MONITOR,     0x10, em_empty,          em_empty,          EM_F_REQ_TAIL | EM_F_REP_TAIL)    \
     X(SNAP_LIST,   0x11, em_empty,          em_empty,          EM_F_REP_TAIL | EM_F_RUNNING)     \
-    X(SNAP_DELETE, 0x12, em_snap_entry,     em_empty,          EM_F_REQ_TAIL | EM_F_RUNNING)
+    X(SNAP_DELETE, 0x12, em_snap_hdr,       em_empty,          EM_F_REQ_TAIL | EM_F_RUNNING)
 
 #define EM_EVENTS(X)                                                                             \
     X(STOPPED,    0x81, em_stopped,      EM_F_REP_TAIL)                                          \

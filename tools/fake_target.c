@@ -427,7 +427,7 @@ static snapshot *snap_by_id(const char *id, const char *name)
     return NULL;
 }
 
-static void snap_describe(const snapshot *snap, em_snap_info *info)
+static void snap_describe(const snapshot *snap, em_snap_entry *info)
 {
     snprintf(info->id, sizeof info->id, "%u", snap->id);
     snprintf(info->name, sizeof info->name, "%s", snap->name);
@@ -435,7 +435,7 @@ static void snap_describe(const snapshot *snap, em_snap_info *info)
 }
 
 /* Saving to a name that already exists updates that snapshot in place; its id stays. */
-static em_status op_snap_save(void *user, const char *name, em_snap_info *saved)
+static em_status op_snap_save(void *user, const char *name, em_snap_entry *saved)
 {
     snapshot *snap;
     char      auto_name[32];
@@ -489,19 +489,20 @@ static em_status op_snap_load(void *user, const char *id, const char *name)
     return EM_OK;
 }
 
-static uint32_t op_snap_count(void *user)
+static em_status op_snap_list(void *user, em_snap_emit emit, void *ctx)
 {
-    (void)user;
-    return snap_count;
-}
+    em_snap_entry snap_entry;
+    em_status     status;
+    uint32_t      index;
 
-static em_status op_snap_info(void *user, uint32_t index, em_snap_info *info)
-{
     (void)user;
-    if (index >= snap_count)
-        return EM_E_BADARG;
-    snap_describe(&snaps[index], info);
-    return EM_OK;
+    status = EM_OK;
+    for (index = 0; index < snap_count && status == EM_OK; index++) {
+        memset(&snap_entry, 0, sizeof snap_entry);
+        snap_describe(&snaps[index], &snap_entry);
+        status = emit(ctx, &snap_entry);
+    }
+    return status;
 }
 
 static em_status op_snap_delete(void *user, const char *id, const char *name)
@@ -526,7 +527,7 @@ static const em_stub_ops ops = {
     NULL,                         /* translate: same */
     op_bp_set, op_bp_clear,
     NULL, NULL,                   /* msr */
-    op_snap_save, op_snap_load, op_snap_count, op_snap_info, op_snap_delete,
+    op_snap_save, op_snap_load, op_snap_list, op_snap_delete,
     op_monitor,
 };
 
