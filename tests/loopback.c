@@ -89,7 +89,11 @@ int main(void)
 {
     static const em_stub_ops ops = { t_send, t_recv, t_rphys, t_wphys, t_get, t_set, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
     static em_stub s;
+    static em_stub s_cpus;
     em_stub_info   info = { "test", 1, EM_RB_BIT(EM_RB_X86_CORE) | EM_RB_BIT(EM_RB_X86_CTRL), 0 };
+    em_stub_info   info_cpus = { "test", 10, EM_RB_BIT(EM_RB_X86_CORE) | EM_RB_BIT(EM_RB_X86_CTRL),
+                                 EM_FEAT_RUN_SET };
+    uint8_t        run_bits[4];
     em_hello_req   hello = { EM_PROTO_VERSION, 8192 };
     em_hello_rep   hrep;
     em_mem_req     mr;
@@ -222,6 +226,63 @@ int main(void)
     CHECK(!memcmp(buf + sizeof(em_rb_hdr), &core, sizeof core));
     h = next(NULL);
     CHECK(h.type == EM_CMD_CONTINUE);
+
+    /* CONTINUE with a cpu bitmap: refused by a target that did not opt in. */
+    run_bits[0] = 0x01;
+    request(EM_CMD_CONTINUE, &empty, sizeof empty, run_bits, 1);
+    deferred_continue++;
+    r = em_stub_stopped(&s, 0, EM_STOP_PAUSE, 0, 0);
+    CHECK(r.action == EM_RESUME_CONTINUE && em_stub_cpu_runs(&s, 0));
+    next(NULL);                               /* STOPPED */
+    h = next(NULL);
+    CHECK(h.type == EM_CMD_CONTINUE && h.status == EM_E_BADARG);
+    h = next(NULL);
+    CHECK(h.type == EM_CMD_CONTINUE && h.status == EM_OK);
+
+    /* A 10-cpu target with EM_FEAT_RUN_SET: an empty set, a cpu past the last one and a
+     * bitmap longer than the cpu count are refused; cpus 1, 3 and 9 are accepted. */
+    em_stub_init(&s_cpus, &ops, NULL, &info_cpus);
+    em_stub_reset(&s_cpus, 0);
+    run_bits[0] = 0x00; run_bits[1] = 0x00;
+    request(EM_CMD_CONTINUE, &empty, sizeof empty, run_bits, 2);
+    run_bits[0] = 0x00; run_bits[1] = 0x04;
+    request(EM_CMD_CONTINUE, &empty, sizeof empty, run_bits, 2);
+    run_bits[0] = 0x01; run_bits[1] = 0x00; run_bits[2] = 0x00;
+    request(EM_CMD_CONTINUE, &empty, sizeof empty, run_bits, 3);
+    run_bits[0] = 0x0A; run_bits[1] = 0x02;
+    request(EM_CMD_CONTINUE, &empty, sizeof empty, run_bits, 2);
+    r = em_stub_stopped(&s_cpus, 0, EM_STOP_PAUSE, 0, 0);
+    CHECK(r.action == EM_RESUME_CONTINUE && r.cpu == 1);
+    CHECK(em_stub_cpu_runs(&s_cpus, 1) && em_stub_cpu_runs(&s_cpus, 3) &&
+          em_stub_cpu_runs(&s_cpus, 9));
+    CHECK(!em_stub_cpu_runs(&s_cpus, 0) && !em_stub_cpu_runs(&s_cpus, 2) &&
+          !em_stub_cpu_runs(&s_cpus, 8) && !em_stub_cpu_runs(&s_cpus, 10));
+    next(NULL);                               /* STOPPED */
+    h = next(NULL);
+    CHECK(h.type == EM_CMD_CONTINUE && h.status == EM_E_BADARG);
+    h = next(NULL);
+    CHECK(h.type == EM_CMD_CONTINUE && h.status == EM_E_BADARG);
+    h = next(NULL);
+    CHECK(h.type == EM_CMD_CONTINUE && h.status == EM_E_BADARG);
+    h = next(NULL);
+    CHECK(h.type == EM_CMD_CONTINUE && h.status == EM_OK);
+
+    /* A step runs only its cpu; a CONTINUE without a bitmap runs them all again. */
+    memset(&step, 0, sizeof step);
+    step.cpu = 4;
+    request(EM_CMD_STEP, &step, sizeof step, 0, 0);
+    r = em_stub_stopped(&s_cpus, 3, EM_STOP_BREAKPOINT, 0, 0);
+    CHECK(r.action == EM_RESUME_STEP && r.cpu == 4);
+    CHECK(em_stub_cpu_runs(&s_cpus, 4) && !em_stub_cpu_runs(&s_cpus, 1));
+    next(NULL);
+    next(NULL);
+    deferred_continue++;
+    r = em_stub_stopped(&s_cpus, 4, EM_STOP_STEP, 0, 0);
+    CHECK(r.action == EM_RESUME_CONTINUE && em_stub_cpu_runs(&s_cpus, 0) &&
+          em_stub_cpu_runs(&s_cpus, 9) && !em_stub_cpu_runs(&s_cpus, 10));
+    next(NULL);
+    h = next(NULL);
+    CHECK(h.type == EM_CMD_CONTINUE && h.status == EM_OK);
 
     /* Corrupted packet drops the connection; stopped() then detaches. */
     request(EM_CMD_HELLO, &hello, sizeof hello, 0, 0);

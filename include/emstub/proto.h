@@ -69,6 +69,18 @@ EM_STATIC_ASSERT(sizeof(em_hello_rep) == 72, "em_hello_rep layout");
 #define EM_FEAT_JIT          (1ull << 0)
 #define EM_FEAT_HW_WATCH     (1ull << 1)
 #define EM_FEAT_PHYS_BP      (1ull << 2)
+#define EM_FEAT_RUN_SET      (1ull << 3)   /* CONTINUE can run a subset of the cpus */
+#define EM_FEAT_HELD_ACCESS  (1ull << 4)   /* held cpus answer GET/SET_REGS, TRANSLATE and
+                                              MSR requests while the others run */
+
+/* CONTINUE: the request is em_empty, optionally followed by a bitmap of the cpus to run
+ * (bit n of byte n / 8 = cpu n). Without the bitmap every cpu runs; the bitmap is only
+ * accepted from stubs that advertise EM_FEAT_RUN_SET.
+ *
+ * Stops are all-stop within the running cpus: when one of them stops, all of them stop.
+ * Cpus outside the set never run. PAUSE stops whatever runs. When several cpus stop at the
+ * same time the stub reports one and keeps the others pending: each later resume that
+ * includes a cpu with a pending stop reports that stop at once, without running anything. */
 
 enum {
     EM_SPACE_VIRT = 0,
@@ -196,7 +208,7 @@ EM_STATIC_ASSERT(sizeof(em_stopped) == 16, "em_stopped layout");
     X(READ_MEM,    0x04, em_mem_req,        em_empty,          EM_F_REP_TAIL | EM_F_RUNNING)     \
     X(WRITE_MEM,   0x05, em_mem_req,        em_empty,          EM_F_REQ_TAIL | EM_F_RUNNING)     \
     X(TRANSLATE,   0x06, em_xlate_req,      em_xlate_rep,      0)                                \
-    X(CONTINUE,    0x07, em_empty,          em_empty,          0)                                \
+    X(CONTINUE,    0x07, em_empty,          em_empty,          EM_F_REQ_TAIL)                    \
     X(STEP,        0x08, em_step_req,       em_empty,          0)                                \
     X(PAUSE,       0x09, em_empty,          em_empty,          EM_F_RUNNING)                     \
     X(BP_SET,      0x0A, em_bp_req,         em_empty,          EM_F_RUNNING)                     \

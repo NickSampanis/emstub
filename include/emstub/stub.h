@@ -15,6 +15,10 @@ extern "C" {
 #define EM_STUB_MAX_PAYLOAD 4096u
 #endif
 
+#ifndef EM_STUB_MAX_CPUS
+#define EM_STUB_MAX_CPUS 256u     /* cpus a CONTINUE bitmap can name; a multiple of 8 */
+#endif
+
 typedef struct em_snap_entry {
     char     id[EM_SNAP_ID_MAX + 1];
     char     name[EM_SNAP_NAME_MAX + 1];
@@ -89,6 +93,8 @@ typedef struct em_stub {
 
     uint8_t            resume_set;
     em_resume          resume;
+    uint8_t            run_all;
+    uint8_t            run_set[EM_STUB_MAX_CPUS / 8];
 
     uint16_t           req_type;
     uint32_t           req_seq;
@@ -107,6 +113,11 @@ em_run    em_stub_poll(em_stub *stub);
 em_resume em_stub_stopped(em_stub *stub, uint16_t cpu, em_stop_reason reason, uint32_t bp_id,
                           uint64_t addr);
 int       em_stub_output(em_stub *stub, const char *text, uint32_t len);
+
+/* After em_stub_stopped returns EM_RESUME_CONTINUE or EM_RESUME_STEP: whether this cpu
+ * runs. A step runs only its cpu; a continue runs every cpu unless the debugger named a
+ * subset (needs EM_FEAT_RUN_SET in em_stub_info.features). */
+int       em_stub_cpu_runs(const em_stub *stub, uint16_t cpu);
 
 #ifdef __cplusplus
 }

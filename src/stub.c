@@ -478,9 +478,36 @@ static void set_resume(em_stub *stub, em_resume_action action, uint16_t cpu)
 
 static em_status h_CONTINUE(em_stub *stub, const uint8_t *req, uint32_t len)
 {
-    (void)req;
-    (void)len;
-    set_resume(stub, EM_RESUME_CONTINUE, 0);
+    const uint8_t       *bitmap;
+    uint32_t             bitmap_len;
+    uint32_t             cpu;
+    uint32_t             first;
+
+    bitmap = req + sizeof(em_empty);
+    bitmap_len = len - (uint32_t)sizeof(em_empty);
+    if (!bitmap_len) {
+        stub->run_all = 1;
+        set_resume(stub, EM_RESUME_CONTINUE, 0);
+        return EM_OK;
+    }
+    if (!(stub->info.features & EM_FEAT_RUN_SET) || bitmap_len > sizeof stub->run_set ||
+        bitmap_len > (stub->info.cpu_count + 7u) / 8u)
+        return EM_E_BADARG;
+    first = EM_STUB_MAX_CPUS;
+    for (cpu = 0; cpu < bitmap_len * 8u; cpu++) {
+        if (!(bitmap[cpu / 8u] & (1u << (cpu % 8u))))
+            continue;
+        if (cpu >= stub->info.cpu_count)
+            return EM_E_BADARG;
+        if (first == EM_STUB_MAX_CPUS)
+            first = cpu;
+    }
+    if (first == EM_STUB_MAX_CPUS)
+        return EM_E_BADARG;
+    em_memset(stub->run_set, 0, sizeof stub->run_set);
+    em_memcpy(stub->run_set, bitmap, bitmap_len);
+    stub->run_all = 0;
+    set_resume(stub, EM_RESUME_CONTINUE, (uint16_t)first);
     return EM_OK;
 }
 
@@ -730,6 +757,49 @@ static void compute_commands(em_stub *stub)
         set_command(stub, EM_CMD_MONITOR);
 }
 
+/* The cpu a request is about, for the commands that name one. */
+static int request_cpu(uint16_t type, const uint8_t *req, uint32_t len, uint16_t *cpu)
+{
+    em_regs_req          regs_req;
+    em_xlate_req         xlate_req;
+    em_msr               msr;
+
+    switch (type) {
+    case EM_CMD_GET_REGS:
+    case EM_CMD_SET_REGS:
+        if (len < sizeof regs_req)
+            return 0;
+        em_memcpy(&regs_req, req, sizeof regs_req);
+        *cpu = regs_req.cpu;
+        return 1;
+    case EM_CMD_TRANSLATE:
+        if (len < sizeof xlate_req)
+            return 0;
+        em_memcpy(&xlate_req, req, sizeof xlate_req);
+        *cpu = xlate_req.cpu;
+        return 1;
+    case EM_CMD_READ_MSR:
+    case EM_CMD_WRITE_MSR:
+        if (len < sizeof msr)
+            return 0;
+        em_memcpy(&msr, req, sizeof msr);
+        *cpu = msr.cpu;
+        return 1;
+    }
+    return 0;
+}
+
+/* While some cpus run, a request about a cpu that is not running is served like when
+ * stopped (EM_FEAT_HELD_ACCESS). */
+static int held_request(const em_stub *stub, uint16_t type, const uint8_t *req, uint32_t len)
+{
+    uint16_t             cpu;
+
+    if (!(stub->info.features & EM_FEAT_HELD_ACCESS) || !request_cpu(type, req, len, &cpu))
+        return 0;
+    return cpu_ok(stub, cpu) && !em_stub_cpu_runs(stub, cpu);
+}
+
 static void handle_packet(em_stub *stub)
 {
     em_hdr               header;
@@ -750,7 +820,8 @@ static void handle_packet(em_stub *stub)
         status = EM_E_UNSUPPORTED;
     else if (header.len < fixed_size || (!(type_flags & EM_F_REQ_TAIL) && header.len != fixed_size))
         status = EM_E_BADARG;
-    else if (stub->running && !(type_flags & EM_F_RUNNING))
+    else if (stub->running && !(type_flags & EM_F_RUNNING) &&
+             !held_request(stub, header.type, RX_PAYLOAD(stub), header.len))
         status = EM_E_RUNNING;
     else {
         stub->in_handler = 1;
@@ -794,6 +865,7 @@ void em_stub_init(em_stub *stub, const em_stub_ops *ops, void *user, const em_st
     stub->user     = user;
     stub->info     = *info;
     stub->peer_max = EM_MIN_PAYLOAD;
+    stub->run_all  = 1;
     compute_commands(stub);
 }
 
@@ -804,6 +876,7 @@ void em_stub_reset(em_stub *stub, int running)
     stub->pause_req    = 0;
     stub->in_handler   = 0;
     stub->resume_set   = 0;
+    stub->run_all      = 1;
     stub->rx_have      = 0;
     stub->peer_max     = EM_MIN_PAYLOAD;
 }
@@ -849,6 +922,15 @@ em_resume em_stub_stopped(em_stub *stub, uint16_t cpu, em_stop_reason reason, ui
 
     stub->running = 1;
     return stub->resume;
+}
+
+int em_stub_cpu_runs(const em_stub *stub, uint16_t cpu)
+{
+    if (stub->resume.action == EM_RESUME_STEP)
+        return cpu == stub->resume.cpu;
+    if (stub->run_all)
+        return cpu < stub->info.cpu_count;
+    return cpu < EM_STUB_MAX_CPUS && (stub->run_set[cpu / 8u] & (1u << (cpu % 8u))) != 0;
 }
 
 int em_stub_output(em_stub *stub, const char *text, uint32_t len)
