@@ -73,6 +73,7 @@ static em_x86_segs segs;
 static em_x86_ctrl ctrl;
 static uint64_t    bps[MAX_BPS];          /* 0 = free slot; id = index + 1 */
 static uint64_t    executed;
+static int         qemu_skip;            /* --qemu-skip: the skip also hides the next instruction's breakpoint */
 
 /* Snapshots live outside the machine, so they survive reset_machine() and reconnects. */
 typedef struct snapshot {
@@ -576,7 +577,7 @@ static void run_session(em_stub *s)
             if (r.action == EM_RESUME_DETACH)
                 return;
             stopped = 0;
-            skip_bp = 1;                      /* resuming from a breakpoint must not re-hit it */
+            skip_bp = qemu_skip ? 2 : 1;      /* resuming from a breakpoint must not re-hit it */
             bp_id = 0;
             addr = 0;
             if (r.action == EM_RESUME_STEP) {
@@ -594,7 +595,8 @@ static void run_session(em_stub *s)
                 reason = EM_STOP_BREAKPOINT;
                 break;
             }
-            skip_bp = 0;
+            if (skip_bp)
+                skip_bp--;
             vec = exec_one();
             if (vec >= 0) {
                 stopped = 1;
@@ -625,7 +627,10 @@ int main(int argc, char **argv)
     int                one = 1;
 #ifdef _WIN32
     WSADATA            wsa;
+#endif
 
+    qemu_skip = argc > 2 && !strcmp(argv[2], "--qemu-skip");
+#ifdef _WIN32
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0)
         return 1;
 #endif
