@@ -2,7 +2,12 @@
  * machine. Use it to develop and test dbgeng and the GUI without Bochs or QEMU.
  *
  *   fake_target [port] [--cpus N] [--qemu-skip] [--no-run-set] [--no-bp-filter]
- *               [--no-held-access]          (default 4242, 127.0.0.1 only, 1 cpu)
+ *               [--no-held-access] [--halted N]   (default 4242, 127.0.0.1 only, 1 cpu)
+ *
+ * --halted N starts cpu N halted, like an AP waiting for INIT-SIPI; cpu 0 wakes it
+ * HALT_WAKE_MS after it first runs. Stepping a halted cpu also runs the last continue's
+ * cpus, held ones staying stopped, until it wakes and executes one instruction (what
+ * QEMU's em-dbg bridge does).
  *
  * With --cpus N (up to 8) every cpu runs the program below on its own stack, sharing
  * memory. Exec breakpoints can be limited to one cpu (em_bp_req.cpu), and a CONTINUE can
@@ -40,6 +45,7 @@
 #include <windows.h>
 typedef SOCKET sock_t;
 static void sleep_ms(unsigned ms) { Sleep(ms); }
+static uint64_t now_ms(void) { return GetTickCount64(); }
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -59,6 +65,14 @@ static void sleep_ms(unsigned ms)
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
     nanosleep(&ts, NULL);
 }
+
+static uint64_t now_ms(void)
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
 #endif
 
 /* --- machine ------------------------------------------------------------------------- */
@@ -76,6 +90,7 @@ static void sleep_ms(unsigned ms)
 #define MAX_CPUS     8
 #define CPU_STACK    0x1000ull       /* each cpu's stack is this far below the previous one */
 #define CPU_STAGGER  5               /* cpu n starts n * CPU_STAGGER instructions ahead */
+#define HALT_WAKE_MS 2000u           /* cpu 0 wakes the --halted cpu this long after it first runs */
 
 typedef struct fake_cpu {
     em_x86_core core;
@@ -83,6 +98,8 @@ typedef struct fake_cpu {
     em_x86_ctrl ctrl;
     int         skip_bp;             /* instructions left that must not re-hit a breakpoint */
     int         pending;             /* stopped in the same round as the reported cpu */
+    int         halted;              /* --halted: waits for cpu 0 to wake it */
+    int         runs;                /* in the last continue's run set (em-dbg's emdbg_runs) */
     em_stop_reason pending_reason;
     uint32_t    pending_bp;
     uint64_t    pending_addr;
@@ -98,6 +115,8 @@ static int         qemu_skip;            /* --qemu-skip: the skip also hides the
 static int         run_sets = 1;         /* --no-run-set: do not offer EM_FEAT_RUN_SET */
 static int         bp_filter = 1;        /* --no-bp-filter: breakpoints stop every cpu */
 static int         held_access = 1;      /* --no-held-access: do not offer EM_FEAT_HELD_ACCESS */
+static int         halted_cpu = -1;      /* --halted N */
+static uint64_t    wake_at;              /* when cpu 0 wakes halted_cpu; 0 = cpu 0 has not run */
 
 /* Snapshots live outside the machine, so they survive reset_machine() and reconnects. */
 typedef struct snapshot {
@@ -212,14 +231,19 @@ static void reset_machine(void)
     memcpy(va_ptr(DATA_ADDR, 4), "\x01\x02\x03\x04", 4);
 
     memset(cpus, 0, sizeof cpus);
-    for (i = 0; i < cpu_count; i++)
+    for (i = 0; i < cpu_count; i++) {
         reset_cpu(&cpus[i], STACK_TOP - i * CPU_STACK);
+        cpus[i].runs = 1;
+    }
 
     memset(bps, 0, sizeof bps);
     executed = 0;
     for (i = 1; i < cpu_count; i++)
         for (step = 0; step < i * CPU_STAGGER; step++)
             exec_one(&cpus[i]);
+    wake_at = 0;
+    if (halted_cpu >= 0 && halted_cpu < cpu_count)
+        cpus[halted_cpu].halted = 1;
 }
 
 static void set_zf(fake_cpu *cpu, int zf)
@@ -667,6 +691,7 @@ static void run_session(em_stub *s)
     uint32_t       other_bp;
     uint16_t       stop_cpu = 0;
     uint16_t       index;
+    int            stepping = -1;        /* halted cpu whose step runs every cpu */
     int            stopped = 1;
     int            vec, i;
 
@@ -676,6 +701,7 @@ static void run_session(em_stub *s)
             if (r.action == EM_RESUME_DETACH)
                 return;
             stopped = 0;
+            stepping = -1;
             bp_id = 0;
             addr = 0;
             if (take_pending(s, &stop_cpu, &reason, &bp_id, &addr)) {
@@ -684,28 +710,52 @@ static void run_session(em_stub *s)
             }
             if (r.action == EM_RESUME_STEP) {
                 stop_cpu = r.cpu < cpu_count ? r.cpu : 0;
-                vec = exec_one(&cpus[stop_cpu]);
-                stopped = 1;
-                reason = vec < 0 ? EM_STOP_STEP : EM_STOP_EXCEPTION;
-                addr = vec < 0 ? 0 : (uint64_t)vec;
-                continue;
+                if (cpus[stop_cpu].halted) {
+                    stepping = stop_cpu;       /* em-dbg: the run set runs with it */
+                } else {
+                    vec = exec_one(&cpus[stop_cpu]);
+                    stopped = 1;
+                    reason = vec < 0 ? EM_STOP_STEP : EM_STOP_EXCEPTION;
+                    addr = vec < 0 ? 0 : (uint64_t)vec;
+                    continue;
+                }
+            } else {
+                for (index = 0; index < cpu_count; index++) {
+                    cpus[index].runs = em_stub_cpu_runs(s, index);
+                    if (cpus[index].runs)
+                        cpus[index].skip_bp = qemu_skip ? 2 : 1;   /* resuming from a breakpoint must not re-hit it */
+                }
             }
-            for (index = 0; index < cpu_count; index++)
-                if (em_stub_cpu_runs(s, index))
-                    cpus[index].skip_bp = qemu_skip ? 2 : 1;   /* resuming from a breakpoint must not re-hit it */
         }
 
         for (i = 0; i < 1000 && !stopped; i++) {
             for (index = 0; index < cpu_count; index++) {
-                if (!em_stub_cpu_runs(s, index))
+                if (stepping >= 0 ? (int)index != stepping && !cpus[index].runs
+                                  : !em_stub_cpu_runs(s, index))
                     continue;
                 cpu = &cpus[index];
-                if (!stopped) {
+                if (cpu->halted)
+                    continue;
+                if (index == 0 && halted_cpu >= 0 && cpus[halted_cpu].halted) {
+                    if (!wake_at)
+                        wake_at = now_ms() + HALT_WAKE_MS;
+                    else if (now_ms() >= wake_at)
+                        cpus[halted_cpu].halted = 0;
+                }
+                if (!stopped && (int)index == stepping) {
+                    vec = exec_one(cpu);
+                    stopped = 1;
+                    stop_cpu = index;
+                    reason = vec < 0 ? EM_STOP_STEP : EM_STOP_EXCEPTION;
+                    bp_id = 0;
+                    addr = vec < 0 ? 0 : (uint64_t)vec;
+                } else if (!stopped) {
                     if (run_one(cpu, index, &reason, &bp_id, &addr)) {
                         stopped = 1;
                         stop_cpu = index;
                     }
-                } else if (run_one(cpu, index, &other_reason, &other_bp, &other_addr)) {
+                } else if ((int)index != stepping &&
+                           run_one(cpu, index, &other_reason, &other_bp, &other_addr)) {
                     cpu->pending = 1;
                     cpu->pending_reason = other_reason;
                     cpu->pending_bp = other_bp;
@@ -751,6 +801,8 @@ int main(int argc, char **argv)
             bp_filter = 0;
         else if (!strcmp(argv[arg], "--no-held-access"))
             held_access = 0;
+        else if (!strcmp(argv[arg], "--halted") && arg + 1 < argc)
+            halted_cpu = atoi(argv[++arg]);
         else
             port = (unsigned)atoi(argv[arg]);
     }
