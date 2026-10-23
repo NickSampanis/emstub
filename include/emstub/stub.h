@@ -69,9 +69,10 @@ typedef enum em_run {
 } em_run;
 
 typedef enum em_resume_action {
-    EM_RESUME_CONTINUE = 0,
-    EM_RESUME_STEP     = 1,
-    EM_RESUME_DETACH   = 2,
+    EM_RESUME_CONTINUE      = 0,
+    EM_RESUME_STEP          = 1,
+    EM_RESUME_DETACH        = 2,
+    EM_RESUME_CONTINUE_STEP = 3,   /* continue, single-stepping em_resume.cpu */
 } em_resume_action;
 
 typedef struct em_resume {
@@ -114,9 +115,10 @@ em_resume em_stub_stopped(em_stub *stub, uint16_t cpu, em_stop_reason reason, ui
                           uint64_t addr);
 int       em_stub_output(em_stub *stub, const char *text, uint32_t len);
 
-/* After em_stub_stopped returns EM_RESUME_CONTINUE or EM_RESUME_STEP: whether this cpu
- * runs. A step runs only its cpu; a continue runs every cpu unless the debugger named a
- * subset (needs EM_FEAT_RUN_SET in em_stub_info.features). */
+/* After em_stub_stopped returns a continue or a step: whether this cpu runs. A step runs
+ * only its cpu; a continue runs every cpu unless the debugger named a subset (needs
+ * EM_FEAT_RUN_SET in em_stub_info.features), and EM_RESUME_CONTINUE_STEP also runs the
+ * stepping cpu (needs EM_FEAT_CONTINUE_STEP). */
 int       em_stub_cpu_runs(const em_stub *stub, uint16_t cpu);
 
 #ifdef __cplusplus

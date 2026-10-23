@@ -72,10 +72,17 @@ EM_STATIC_ASSERT(sizeof(em_hello_rep) == 72, "em_hello_rep layout");
 #define EM_FEAT_RUN_SET      (1ull << 3)   /* CONTINUE can run a subset of the cpus */
 #define EM_FEAT_HELD_ACCESS  (1ull << 4)   /* held cpus answer GET/SET_REGS, TRANSLATE and
                                               MSR requests while the others run */
+#define EM_FEAT_CONTINUE_STEP (1ull << 5)  /* CONTINUE can single-step one cpu while the
+                                              others run (EM_CONTINUE_STEP) */
 
-/* CONTINUE: the request is em_empty, optionally followed by a bitmap of the cpus to run
- * (bit n of byte n / 8 = cpu n). Without the bitmap every cpu runs; the bitmap is only
- * accepted from stubs that advertise EM_FEAT_RUN_SET.
+/* CONTINUE: the request is em_continue_req, optionally followed by a bitmap of the cpus to
+ * run (bit n of byte n / 8 = cpu n). Without the bitmap every cpu runs; the bitmap is only
+ * accepted from stubs that advertise EM_FEAT_RUN_SET. With EM_CONTINUE_STEP, cpu also
+ * runs, single-stepping: it stops with EM_STOP_STEP after its next instruction, which for
+ * a halted cpu is the first one after something wakes it.
+ *
+ * STEP runs only its cpu; the others stay stopped. A halted cpu finishes its step only if
+ * something other than another cpu wakes it; otherwise it runs until PAUSE.
  *
  * Stops are all-stop within the running cpus: when one of them stops, all of them stop.
  * Cpus outside the set never run. PAUSE stops whatever runs. When several cpus stop at the
@@ -137,6 +144,14 @@ typedef struct em_step_req {
     uint16_t reserved[3];
 } em_step_req;
 EM_STATIC_ASSERT(sizeof(em_step_req) == 8, "em_step_req layout");
+
+#define EM_CONTINUE_STEP 1u
+
+typedef struct em_continue_req {
+    uint16_t flags;
+    uint16_t cpu;
+} em_continue_req;
+EM_STATIC_ASSERT(sizeof(em_continue_req) == 4, "em_continue_req layout");
 
 typedef struct em_bp_req {
     uint64_t addr;
@@ -208,7 +223,7 @@ EM_STATIC_ASSERT(sizeof(em_stopped) == 16, "em_stopped layout");
     X(READ_MEM,    0x04, em_mem_req,        em_empty,          EM_F_REP_TAIL | EM_F_RUNNING)     \
     X(WRITE_MEM,   0x05, em_mem_req,        em_empty,          EM_F_REQ_TAIL | EM_F_RUNNING)     \
     X(TRANSLATE,   0x06, em_xlate_req,      em_xlate_rep,      0)                                \
-    X(CONTINUE,    0x07, em_empty,          em_empty,          EM_F_REQ_TAIL)                    \
+    X(CONTINUE,    0x07, em_continue_req,   em_empty,          EM_F_REQ_TAIL)                    \
     X(STEP,        0x08, em_step_req,       em_empty,          0)                                \
     X(PAUSE,       0x09, em_empty,          em_empty,          EM_F_RUNNING)                     \
     X(BP_SET,      0x0A, em_bp_req,         em_empty,          EM_F_RUNNING)                     \

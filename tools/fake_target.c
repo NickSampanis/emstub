@@ -5,9 +5,9 @@
  *               [--no-held-access] [--halted N]   (default 4242, 127.0.0.1 only, 1 cpu)
  *
  * --halted N starts cpu N halted, like an AP waiting for INIT-SIPI; cpu 0 wakes it
- * HALT_WAKE_MS after it first runs. Stepping a halted cpu also runs the last continue's
- * cpus, held ones staying stopped, until it wakes and executes one instruction (what
- * QEMU's em-dbg bridge does).
+ * HALT_WAKE_MS after it first runs. A step runs only its cpu, so stepping the halted cpu
+ * waits until PAUSE; a CONTINUE with EM_CONTINUE_STEP runs the others with it until it
+ * wakes and executes one instruction (what QEMU's em-dbg bridge does).
  *
  * With --cpus N (up to 8) every cpu runs the program below on its own stack, sharing
  * memory. Exec breakpoints can be limited to one cpu (em_bp_req.cpu), and a CONTINUE can
@@ -99,7 +99,6 @@ typedef struct fake_cpu {
     int         skip_bp;             /* instructions left that must not re-hit a breakpoint */
     int         pending;             /* stopped in the same round as the reported cpu */
     int         halted;              /* --halted: waits for cpu 0 to wake it */
-    int         runs;                /* in the last continue's run set (em-dbg's emdbg_runs) */
     em_stop_reason pending_reason;
     uint32_t    pending_bp;
     uint64_t    pending_addr;
@@ -231,10 +230,8 @@ static void reset_machine(void)
     memcpy(va_ptr(DATA_ADDR, 4), "\x01\x02\x03\x04", 4);
 
     memset(cpus, 0, sizeof cpus);
-    for (i = 0; i < cpu_count; i++) {
+    for (i = 0; i < cpu_count; i++)
         reset_cpu(&cpus[i], STACK_TOP - i * CPU_STACK);
-        cpus[i].runs = 1;
-    }
 
     memset(bps, 0, sizeof bps);
     executed = 0;
@@ -676,7 +673,8 @@ static uint16_t first_running(em_stub *s)
 
 /* Run the machine for one debugger connection. Starts stopped (EM_STOP_ATTACH).
  * All-stop: a continue runs the cpus the debugger named (all of them by default), one
- * instruction each in turn, until one of them stops; a step runs only the requested cpu.
+ * instruction each in turn, until one of them stops; a step runs only the requested cpu,
+ * and a continue that steps a cpu stops after that cpu's next instruction.
  * The round in which a cpu stops is finished, like cores running in parallel: a second
  * cpu that stops in it keeps its stop pending for a later resume. */
 static void run_session(em_stub *s)
@@ -691,7 +689,7 @@ static void run_session(em_stub *s)
     uint32_t       other_bp;
     uint16_t       stop_cpu = 0;
     uint16_t       index;
-    int            stepping = -1;        /* halted cpu whose step runs every cpu */
+    int            stepping = -1;        /* cpu that stops after its next instruction */
     int            stopped = 1;
     int            vec, i;
 
@@ -708,30 +706,25 @@ static void run_session(em_stub *s)
                 stopped = 1;
                 continue;
             }
-            if (r.action == EM_RESUME_STEP) {
-                stop_cpu = r.cpu < cpu_count ? r.cpu : 0;
-                if (cpus[stop_cpu].halted) {
-                    stepping = stop_cpu;       /* em-dbg: the run set runs with it */
-                } else {
-                    vec = exec_one(&cpus[stop_cpu]);
-                    stopped = 1;
-                    reason = vec < 0 ? EM_STOP_STEP : EM_STOP_EXCEPTION;
-                    addr = vec < 0 ? 0 : (uint64_t)vec;
-                    continue;
-                }
-            } else {
-                for (index = 0; index < cpu_count; index++) {
-                    cpus[index].runs = em_stub_cpu_runs(s, index);
-                    if (cpus[index].runs)
-                        cpus[index].skip_bp = qemu_skip ? 2 : 1;   /* resuming from a breakpoint must not re-hit it */
-                }
+            if (r.action == EM_RESUME_STEP || r.action == EM_RESUME_CONTINUE_STEP)
+                stepping = r.cpu < cpu_count ? r.cpu : 0;
+            if (r.action == EM_RESUME_STEP && !cpus[stepping].halted) {
+                stop_cpu = (uint16_t)stepping;
+                vec = exec_one(&cpus[stop_cpu]);
+                stopped = 1;
+                reason = vec < 0 ? EM_STOP_STEP : EM_STOP_EXCEPTION;
+                addr = vec < 0 ? 0 : (uint64_t)vec;
+                continue;
             }
+            if (r.action != EM_RESUME_STEP)
+                for (index = 0; index < cpu_count; index++)
+                    if (em_stub_cpu_runs(s, index))
+                        cpus[index].skip_bp = qemu_skip ? 2 : 1;   /* resuming from a breakpoint must not re-hit it */
         }
 
         for (i = 0; i < 1000 && !stopped; i++) {
             for (index = 0; index < cpu_count; index++) {
-                if (stepping >= 0 ? (int)index != stepping && !cpus[index].runs
-                                  : !em_stub_cpu_runs(s, index))
+                if (!em_stub_cpu_runs(s, index))
                     continue;
                 cpu = &cpus[index];
                 if (cpu->halted)
@@ -833,7 +826,8 @@ int main(int argc, char **argv)
     info.cpu_count = cpu_count;
     info.regblocks = EM_RB_BIT(EM_RB_X86_CORE) | EM_RB_BIT(EM_RB_X86_SEG) |
                      EM_RB_BIT(EM_RB_X86_CTRL);
-    info.features = (run_sets ? EM_FEAT_RUN_SET : 0) | (held_access ? EM_FEAT_HELD_ACCESS : 0);
+    info.features = (run_sets ? EM_FEAT_RUN_SET : 0) | (held_access ? EM_FEAT_HELD_ACCESS : 0) |
+                    EM_FEAT_CONTINUE_STEP;
 
     printf("fake_target listening on 127.0.0.1:%u (%u cpu%s)\n", port, cpu_count,
            cpu_count == 1 ? "" : "s");

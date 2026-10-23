@@ -478,16 +478,27 @@ static void set_resume(em_stub *stub, em_resume_action action, uint16_t cpu)
 
 static em_status h_CONTINUE(em_stub *stub, const uint8_t *req, uint32_t len)
 {
+    em_continue_req      continue_req;
+    em_resume_action     action;
     const uint8_t       *bitmap;
     uint32_t             bitmap_len;
     uint32_t             cpu;
     uint32_t             first;
 
-    bitmap = req + sizeof(em_empty);
-    bitmap_len = len - (uint32_t)sizeof(em_empty);
+    em_memcpy(&continue_req, req, sizeof continue_req);
+    action = EM_RESUME_CONTINUE;
+    if (continue_req.flags & ~EM_CONTINUE_STEP)
+        return EM_E_BADARG;
+    if (continue_req.flags & EM_CONTINUE_STEP) {
+        if (!(stub->info.features & EM_FEAT_CONTINUE_STEP) || !cpu_ok(stub, continue_req.cpu))
+            return EM_E_BADARG;
+        action = EM_RESUME_CONTINUE_STEP;
+    }
+    bitmap = req + sizeof continue_req;
+    bitmap_len = len - (uint32_t)sizeof continue_req;
     if (!bitmap_len) {
         stub->run_all = 1;
-        set_resume(stub, EM_RESUME_CONTINUE, 0);
+        set_resume(stub, action, action == EM_RESUME_CONTINUE_STEP ? continue_req.cpu : 0);
         return EM_OK;
     }
     if (!(stub->info.features & EM_FEAT_RUN_SET) || bitmap_len > sizeof stub->run_set ||
@@ -507,7 +518,7 @@ static em_status h_CONTINUE(em_stub *stub, const uint8_t *req, uint32_t len)
     em_memset(stub->run_set, 0, sizeof stub->run_set);
     em_memcpy(stub->run_set, bitmap, bitmap_len);
     stub->run_all = 0;
-    set_resume(stub, EM_RESUME_CONTINUE, (uint16_t)first);
+    set_resume(stub, action, action == EM_RESUME_CONTINUE_STEP ? continue_req.cpu : (uint16_t)first);
     return EM_OK;
 }
 
@@ -928,6 +939,8 @@ int em_stub_cpu_runs(const em_stub *stub, uint16_t cpu)
 {
     if (stub->resume.action == EM_RESUME_STEP)
         return cpu == stub->resume.cpu;
+    if (stub->resume.action == EM_RESUME_CONTINUE_STEP && cpu == stub->resume.cpu)
+        return 1;
     if (stub->run_all)
         return cpu < stub->info.cpu_count;
     return cpu < EM_STUB_MAX_CPUS && (stub->run_set[cpu / 8u] & (1u << (cpu % 8u))) != 0;

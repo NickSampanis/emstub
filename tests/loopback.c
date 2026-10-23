@@ -92,7 +92,7 @@ int main(void)
     static em_stub s_cpus;
     em_stub_info   info = { "test", 1, EM_RB_BIT(EM_RB_X86_CORE) | EM_RB_BIT(EM_RB_X86_CTRL), 0 };
     em_stub_info   info_cpus = { "test", 10, EM_RB_BIT(EM_RB_X86_CORE) | EM_RB_BIT(EM_RB_X86_CTRL),
-                                 EM_FEAT_RUN_SET };
+                                 EM_FEAT_RUN_SET | EM_FEAT_CONTINUE_STEP };
     uint8_t        run_bits[4];
     em_hello_req   hello = { EM_PROTO_VERSION, 8192 };
     em_hello_rep   hrep;
@@ -101,6 +101,7 @@ int main(void)
     em_xlate_rep   xp;
     em_regs_req    rr;
     em_step_req    step;
+    em_continue_req cont;
     uint32_t       full_len;
     em_empty       empty = { 0 };
     em_stopped     ev;
@@ -281,6 +282,42 @@ int main(void)
     CHECK(r.action == EM_RESUME_CONTINUE && em_stub_cpu_runs(&s_cpus, 0) &&
           em_stub_cpu_runs(&s_cpus, 9) && !em_stub_cpu_runs(&s_cpus, 10));
     next(NULL);
+    h = next(NULL);
+    CHECK(h.type == EM_CMD_CONTINUE && h.status == EM_OK);
+
+    /* A CONTINUE that steps cpu 2 while cpus 1 and 3 run; unknown flags and a cpu past the
+     * last one are refused. */
+    memset(&cont, 0, sizeof cont);
+    cont.flags = 2;
+    request(EM_CMD_CONTINUE, &cont, sizeof cont, 0, 0);
+    cont.flags = EM_CONTINUE_STEP;
+    cont.cpu = 10;
+    request(EM_CMD_CONTINUE, &cont, sizeof cont, 0, 0);
+    cont.cpu = 2;
+    run_bits[0] = 0x0A;
+    request(EM_CMD_CONTINUE, &cont, sizeof cont, run_bits, 1);
+    r = em_stub_stopped(&s_cpus, 4, EM_STOP_PAUSE, 0, 0);
+    CHECK(r.action == EM_RESUME_CONTINUE_STEP && r.cpu == 2);
+    CHECK(em_stub_cpu_runs(&s_cpus, 1) && em_stub_cpu_runs(&s_cpus, 2) &&
+          em_stub_cpu_runs(&s_cpus, 3));
+    CHECK(!em_stub_cpu_runs(&s_cpus, 0) && !em_stub_cpu_runs(&s_cpus, 4));
+    next(NULL);                               /* STOPPED */
+    h = next(NULL);
+    CHECK(h.type == EM_CMD_CONTINUE && h.status == EM_E_BADARG);
+    h = next(NULL);
+    CHECK(h.type == EM_CMD_CONTINUE && h.status == EM_E_BADARG);
+    h = next(NULL);
+    CHECK(h.type == EM_CMD_CONTINUE && h.status == EM_OK);
+
+    /* A target without EM_FEAT_CONTINUE_STEP refuses the step. */
+    cont.cpu = 0;
+    request(EM_CMD_CONTINUE, &cont, sizeof cont, 0, 0);
+    deferred_continue++;
+    r = em_stub_stopped(&s, 0, EM_STOP_PAUSE, 0, 0);
+    CHECK(r.action == EM_RESUME_CONTINUE);
+    next(NULL);                               /* STOPPED */
+    h = next(NULL);
+    CHECK(h.type == EM_CMD_CONTINUE && h.status == EM_E_BADARG);
     h = next(NULL);
     CHECK(h.type == EM_CMD_CONTINUE && h.status == EM_OK);
 
