@@ -2,7 +2,8 @@
  * machine. Use it to develop and test dbgeng and the GUI without Bochs or QEMU.
  *
  *   fake_target [port] [--cpus N] [--qemu-skip] [--no-run-set] [--no-bp-filter]
- *               [--no-held-access] [--halted N]   (default 4242, 127.0.0.1 only, 1 cpu)
+ *               [--no-held-access] [--halted N] [--vmx]
+ *               (default 4242, 127.0.0.1 only, 1 cpu)
  *
  * --halted N starts cpu N halted, like an AP waiting for INIT-SIPI; cpu 0 wakes it
  * HALT_WAKE_MS after it first runs. A step runs only its cpu, so stepping the halted cpu
@@ -21,6 +22,14 @@
  *   start:    call main ; jmp start
  *   main:     return checksum(data, 4)          data = { 1, 2, 3, 4 } at 0x402000
  *   checksum: sum = (sum << 1) ^ buf[i] for each byte
+ *
+ * and, at 0x401050, a recursive countdown that nothing calls (set rip to reach it):
+ *
+ *   countdown: if (esi) { esi--; countdown(); }
+ *
+ * and, at 0x401060, saver, also not called: it spills rcx to its home slot, pushes rbx,
+ * sets rbx = 0x1234 and restores it. A PE32+ header at 0x400000 carries .pdata with
+ * unwind codes for main and saver, so the stack can be unwound like a UEFI image.
  *
  * Only these instructions are understood (dispatch is by address, not by decoding),
  * plus int3: a 0xCC byte written over an instruction traps like on real hardware
@@ -96,6 +105,11 @@ typedef struct fake_cpu {
     em_x86_core core;
     em_x86_segs segs;
     em_x86_ctrl ctrl;
+    em_x86_vmx  vmx;                 /* --vmx */
+    em_x86_guest guest;
+    em_x86_ctrl guest_ctrl;          /* the cpu's control registers in non-root */
+    int         in_guest;            /* --vmx: executing the guest (non-root) */
+    uint32_t    exit_len;            /* length of the instruction that caused the last exit */
     int         skip_bp;             /* instructions left that must not re-hit a breakpoint */
     int         pending;             /* stopped in the same round as the reported cpu */
     int         halted;              /* --halted: waits for cpu 0 to wake it */
@@ -156,7 +170,37 @@ static const uint8_t program[] = {
     /* 0x401040 start */
     0xE8, 0xDB, 0xFF, 0xFF, 0xFF,              /* call 0x401020                   */
     0xEB, 0xF9,                                /* jmp 0x401040                    */
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+    /* 0x401050 countdown */
+    0x85, 0xF6,                                /* test esi, esi                   */
+    0x74, 0x07,                                /* je 0x40105B                     */
+    0xFF, 0xCE,                                /* dec esi                         */
+    0xE8, 0xF5, 0xFF, 0xFF, 0xFF,              /* call 0x401050                   */
+    0xC3,                                      /* ret                             */
+    0xCC, 0xCC, 0xCC, 0xCC,
+    /* 0x401060 saver */
+    0x48, 0x89, 0x4C, 0x24, 0x08,              /* mov [rsp+8], rcx                */
+    0x53,                                      /* push rbx                        */
+    0x48, 0xC7, 0xC3, 0x34, 0x12, 0x00, 0x00,  /* mov rbx, 0x1234                 */
+    0x90,                                      /* nop                             */
+    0x5B,                                      /* pop rbx                         */
+    0xC3,                                      /* ret                             */
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+    0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC,
+    /* 0x401080 vmx_exit_handler (--vmx: host rip after a VM exit) */
+    0x90,                                      /* nop                             */
+    0x0F, 0x01, 0xC3,                          /* vmresume                        */
 };
+
+/* .pdata at rva 0x3000: RUNTIME_FUNCTION { begin, end, unwind info } for main and saver.
+ * main's prolog is sub rsp, 0x28 (UWOP_ALLOC_SMALL 4); saver's is push rbx
+ * (UWOP_PUSH_NONVOL rbx), after the home-space spill. */
+static const uint8_t pdata[] = {
+    0x20, 0x10, 0x00, 0x00,  0x3A, 0x10, 0x00, 0x00,  0x20, 0x30, 0x00, 0x00,
+    0x60, 0x10, 0x00, 0x00,  0x70, 0x10, 0x00, 0x00,  0x30, 0x30, 0x00, 0x00,
+};
+static const uint8_t main_unwind[] = { 0x01, 0x04, 0x01, 0x00, 0x04, 0x42, 0x00, 0x00 };
+static const uint8_t saver_unwind[] = { 0x01, 0x06, 0x01, 0x00, 0x06, 0x30, 0x00, 0x00 };
 
 static uint8_t *va_ptr(uint64_t va, uint32_t len)
 {
@@ -186,6 +230,375 @@ static void write64(uint64_t va, uint64_t v)
 static void put_pte(uint64_t pa, uint64_t value)
 {
     memcpy(ram + pa, &value, 8);
+}
+
+static void put_le(uint64_t va, uint64_t value, uint32_t len)
+{
+    uint8_t *p = va_ptr(va, len);
+    uint32_t i;
+
+    for (i = 0; p && i < len; i++)
+        p[i] = (uint8_t)(value >> (i * 8));
+}
+
+/* A PE32+ header at VA_BASE so debuggers find .pdata for the program, like for a UEFI image:
+ * one .text section over [0x1000, 0x4000) and the exception directory at rva 0x3000. */
+static void put_image(void)
+{
+    const uint64_t pe = VA_BASE + 0x40;
+    const uint64_t optional = pe + 24;
+    const uint64_t section = optional + 0xF0;
+
+    memcpy(va_ptr(VA_BASE, 2), "MZ", 2);
+    put_le(VA_BASE + 0x3C, 0x40, 4);
+    memcpy(va_ptr(pe, 4), "PE\0\0", 4);
+    put_le(pe + 4, 0x8664, 2);                    /* machine: x64 */
+    put_le(pe + 6, 1, 2);                         /* one section */
+    put_le(pe + 20, 0xF0, 2);                     /* optional header size */
+    put_le(pe + 22, 0x22, 2);
+    put_le(optional, 0x20B, 2);                   /* PE32+ */
+    put_le(optional + 16, ENTRY - VA_BASE, 4);
+    put_le(optional + 24, VA_BASE, 8);
+    put_le(optional + 32, 0x1000, 4);
+    put_le(optional + 36, 0x200, 4);
+    put_le(optional + 56, VA_SIZE, 4);            /* SizeOfImage */
+    put_le(optional + 60, 0x400, 4);
+    put_le(optional + 108, 16, 4);                /* data directories */
+    put_le(optional + 112 + 3 * 8, 0x3000, 4);    /* exception directory */
+    put_le(optional + 112 + 3 * 8 + 4, sizeof pdata, 4);
+    memcpy(va_ptr(section, 5), ".text", 5);
+    put_le(section + 8, 0x3000, 4);
+    put_le(section + 12, 0x1000, 4);
+    put_le(section + 36, 0x60000020, 4);
+    memcpy(va_ptr(VA_BASE + 0x3000, sizeof pdata), pdata, sizeof pdata);
+    memcpy(va_ptr(VA_BASE + 0x3020, sizeof main_unwind), main_unwind, sizeof main_unwind);
+    memcpy(va_ptr(VA_BASE + 0x3030, sizeof saver_unwind), saver_unwind, sizeof saver_unwind);
+}
+
+/* --- VMX (--vmx) ---------------------------------------------------------------------- */
+
+/* With --vmx every cpu reports VMX root operation with a current VMCS whose guest runs
+ * on an EPT. Nothing executes in the guest; the VMX and guest register blocks and the
+ * tables in RAM let a debugger walk guest memory. "vmx nonroot" reports the cpus as
+ * stopped in the guest: their own registers are then the guest's (as on hardware), so
+ * the stub's own virtual reads walk the guest's cr3. The guest's loop really runs: its
+ * vmcall exits to the host at 0x401080 (nop; vmresume), whose vmresume skips the vmcall
+ * and enters the guest again. Breakpoints match whatever address the cpu executes next,
+ * in either mode, like linear-address breakpoints in QEMU:
+ *
+ *   EPT (host phys 0x80000, 4-level, WB, A/D):
+ *     gpa 0x00000-0x3DFFF  -> 0xC0000 + gpa   RWX WB, 4K pages
+ *     gpa 0x3E000          -> 0xFE000         R only
+ *     gpa 0x3F000          not present (EPT violation)
+ *     gpa 0x200000 (2M)    -> 0x0             R-X, the host's own first 2 MB
+ *
+ *   Guest page tables (gpa), selected with "vmx guest <mode>":
+ *     4-level  cr3 0x1000   5-level  cr3 0x5000   PAE  cr3 0x8000   32-bit  cr3 0x6000
+ *     gva 0x400000 + n * 0x1000 -> gpa 0x10000 + n * 0x1000 for n < 16 ("guest page n")
+ *     guest rip 0x401100 (gpa 0x11100; cs:ip 1000:1100 with paging off): a loop with vmcall
+ *     gva 0x410000  not present in the guest page tables
+ *     gva 0x411000  -> gpa 0x3E000 (EPT read-only)
+ *     gva 0x412000  -> gpa 0x3F000 (EPT violation)
+ *     gva 0x600000  2M page -> gpa 0x200000 (4-level, 5-level, PAE)
+ *     gva 0x800000  4M page -> gpa 0 (32-bit)
+ *     paging off: gva = gpa
+ */
+
+#define VMX_EPT_PML4    0x80000ull
+#define VMX_EPT_PDPT    0x81000ull
+#define VMX_EPT_PD      0x82000ull
+#define VMX_EPT_PT      0x83000ull
+#define VMX_VMXON       0x86000ull
+#define VMX_VMCS        0x87000ull
+#define VMX_GUEST_HPA   0xC0000ull
+#define VMX_GUEST_PAGES 0x40u
+#define VMX_EPT_WB      (6ull << 3)
+#define VMX_EPTP        (VMX_EPT_PML4 | (3ull << 3) | 6 | 0x40)
+#define VMX_HOST_HANDLER 0x401080ull     /* host rip after a VM exit: nop; vmresume */
+#define VMX_EXIT_VMCALL 18u
+
+enum {
+    VMX_GUEST_OFF,
+    VMX_GUEST_32,
+    VMX_GUEST_PAE,
+    VMX_GUEST_4LEVEL,
+    VMX_GUEST_5LEVEL,
+};
+
+static const char *const vmx_guest_names[] = { "off", "32", "pae", "4", "5" };
+
+static int vmx_enabled;                     /* --vmx */
+static int vmx_ept = 1;                     /* "vmx ept off": the VMCS does not enable EPT */
+static int vmx_guest_mode = VMX_GUEST_4LEVEL;
+
+static const uint8_t guest_code[] = {
+    0x48, 0x31, 0xC0,                          /* xor rax, rax                    */
+    0x48, 0xFF, 0xC0,                          /* inc rax                         */
+    0x0F, 0x01, 0xC1,                          /* vmcall                          */
+    0xEB, 0xF5,                                /* jmp guest rip + 0               */
+};
+
+static void put_guest64(uint64_t gpa, uint64_t value)
+{
+    put_pte(VMX_GUEST_HPA + gpa, value);
+}
+
+static void put_guest32(uint64_t gpa, uint32_t value)
+{
+    memcpy(ram + VMX_GUEST_HPA + gpa, &value, 4);
+}
+
+static void build_vmx_tables(void)
+{
+    uint64_t page;
+    char     text[32];
+
+    put_pte(VMX_EPT_PML4, VMX_EPT_PDPT | 7);
+    put_pte(VMX_EPT_PDPT, VMX_EPT_PD | 7);
+    put_pte(VMX_EPT_PD, VMX_EPT_PT | 7);
+    put_pte(VMX_EPT_PD + 1 * 8, 0x0 | 0x80 | VMX_EPT_WB | 5);
+    for (page = 0; page < VMX_GUEST_PAGES - 2; page++)
+        put_pte(VMX_EPT_PT + page * 8, (VMX_GUEST_HPA + page * 0x1000) | VMX_EPT_WB | 7);
+    put_pte(VMX_EPT_PT + 0x3E * 8, (VMX_GUEST_HPA + 0x3E000) | VMX_EPT_WB | 1);
+
+    put_guest64(0x1000, 0x2000 | 7);
+    put_guest64(0x2000, 0x3000 | 7);
+    put_guest64(0x3000 + 2 * 8, 0x4000 | 7);
+    put_guest64(0x3000 + 3 * 8, 0x200000 | 0x87);
+    for (page = 0; page < 16; page++)
+        put_guest64(0x4000 + page * 8, (0x10000 + page * 0x1000) | 7);
+    put_guest64(0x4000 + 0x11 * 8, 0x3E000 | 7);
+    put_guest64(0x4000 + 0x12 * 8, 0x3F000 | 7);
+
+    put_guest64(0x5000, 0x1000 | 7);
+
+    put_guest32(0x6000 + 1 * 4, 0x7000 | 7);
+    put_guest32(0x6000 + 2 * 4, 0x0 | 0x87);
+    for (page = 0; page < 16; page++)
+        put_guest32(0x7000 + page * 4, (uint32_t)(0x10000 + page * 0x1000) | 7);
+    put_guest32(0x7000 + 0x11 * 4, 0x3E000 | 7);
+    put_guest32(0x7000 + 0x12 * 4, 0x3F000 | 7);
+
+    put_guest64(0x8000, 0x9000 | 1);
+    put_guest64(0x9000 + 2 * 8, 0x4000 | 7);
+    put_guest64(0x9000 + 3 * 8, 0x200000 | 0x87);
+
+    for (page = 0; page < 16; page++) {
+        snprintf(text, sizeof text, "guest page %02x", (unsigned)page);
+        memcpy(ram + VMX_GUEST_HPA + 0x10000 + page * 0x1000, text, strlen(text) + 1);
+    }
+    memcpy(ram + VMX_GUEST_HPA + 0x3E000, "read-only page", 15);
+    memcpy(ram + VMX_GUEST_HPA + 0x11100, guest_code, sizeof guest_code);
+}
+
+static void fill_vmx(fake_cpu *cpu)
+{
+    em_x86_vmx   *vmx;
+    em_x86_guest *guest;
+    int           long_mode;
+
+    vmx = &cpu->vmx;
+    guest = &cpu->guest;
+    memset(vmx, 0, sizeof *vmx);
+    memset(guest, 0, sizeof *guest);
+    long_mode = vmx_guest_mode == VMX_GUEST_4LEVEL || vmx_guest_mode == VMX_GUEST_5LEVEL;
+
+    vmx->valid = EM_VMX_V_STATE | EM_VMX_V_CTLS | EM_VMX_V_GUEST | EM_VMX_V_HOST | EM_VMX_V_EXIT;
+    vmx->flags = EM_VMX_F_ON | EM_VMX_F_VMCS | EM_VMX_F_VPID | EM_VMX_F_UG |
+                 (vmx_ept ? EM_VMX_F_EPT : 0) | (cpu->in_guest ? EM_VMX_F_NON_ROOT : 0);
+    vmx->vmxon_pa = VMX_VMXON;
+    vmx->vmcs_pa = VMX_VMCS;
+    vmx->eptp = VMX_EPTP;
+    vmx->vpid = 1;
+    vmx->proc_ctls = 1ull << 31;
+    vmx->proc_ctls2 = (vmx_ept ? EM_VMX_PROC2_EPT : 0) | EM_VMX_PROC2_VPID | EM_VMX_PROC2_UG;
+    vmx->exit_ctls = EM_VMX_EXIT_HOST_64;
+    vmx->entry_ctls = long_mode ? EM_VMX_ENTRY_IA32E : 0;
+
+    vmx->guest_cr0 = 0x80000011;
+    vmx->guest_pat = 0x0007040600070406ull;
+    switch (vmx_guest_mode) {
+    case VMX_GUEST_OFF:
+        vmx->guest_cr0 = 0x10;
+        break;
+    case VMX_GUEST_32:
+        vmx->guest_cr3 = 0x6000;
+        vmx->guest_cr4 = 0x10;
+        break;
+    case VMX_GUEST_PAE:
+        vmx->guest_cr3 = 0x8000;
+        vmx->guest_cr4 = 0x20;
+        memcpy(vmx->guest_pdpte, ram + VMX_GUEST_HPA + 0x8000, sizeof vmx->guest_pdpte);
+        break;
+    case VMX_GUEST_4LEVEL:
+        vmx->guest_cr3 = 0x1000;
+        vmx->guest_cr4 = 0x20;
+        vmx->guest_efer = 0xD00;
+        break;
+    case VMX_GUEST_5LEVEL:
+        vmx->guest_cr3 = 0x5000;
+        vmx->guest_cr4 = 0x1020;
+        vmx->guest_efer = 0xD00;
+        break;
+    }
+
+    vmx->host_cr0 = cpu->ctrl.cr0;
+    vmx->host_cr3 = cpu->ctrl.cr3;
+    vmx->host_cr4 = cpu->ctrl.cr4;
+    vmx->host_efer = cpu->ctrl.efer;
+    vmx->host_rip = VMX_HOST_HANDLER;
+    vmx->host_rsp = cpu->core.rsp;
+    vmx->exit_reason = 10;
+
+    memset(&cpu->guest_ctrl, 0, sizeof cpu->guest_ctrl);
+    cpu->guest_ctrl.cr0 = vmx->guest_cr0;
+    cpu->guest_ctrl.cr3 = vmx->guest_cr3;
+    cpu->guest_ctrl.cr4 = vmx->guest_cr4;
+    cpu->guest_ctrl.efer = vmx->guest_efer;
+    cpu->guest_ctrl.dr6 = 0xFFFF0FF0;
+    cpu->guest_ctrl.dr7 = 0x400;
+
+    guest->valid = EM_GUEST_V_GPRS | EM_GUEST_V_RIP | EM_GUEST_V_SEGS;
+    guest->core.rax = 0x1111;
+    guest->core.rbx = 0x2222;
+    guest->core.rip = vmx_guest_mode == VMX_GUEST_OFF ? 0x1100 : 0x401100;
+    guest->core.rsp = vmx_guest_mode == VMX_GUEST_OFF ? 0x1F000 : 0x40F000;
+    guest->core.rflags = 0x2;
+    guest->seg.cs.selector = vmx_guest_mode == VMX_GUEST_OFF ? 0x1000 : 0x10;
+    guest->seg.cs.base = vmx_guest_mode == VMX_GUEST_OFF ? 0x10000 : 0;
+    guest->seg.cs.limit = vmx_guest_mode == VMX_GUEST_OFF ? 0xFFFF : 0xFFFFFFFF;
+    guest->seg.cs.attr = long_mode ? 0x209B : (vmx_guest_mode == VMX_GUEST_OFF ? 0x9B : 0xC09B);
+}
+
+static void fill_all_vmx(void)
+{
+    uint16_t cpu;
+
+    for (cpu = 0; cpu < cpu_count; cpu++)
+        fill_vmx(&cpus[cpu]);
+}
+
+static void set_in_guest(int in_guest)
+{
+    uint16_t cpu;
+
+    for (cpu = 0; cpu < cpu_count; cpu++)
+        cpus[cpu].in_guest = in_guest;
+}
+
+/* Linear address the guest executes at, and where its loop starts. */
+static uint64_t guest_pc(const fake_cpu *cpu)
+{
+    if (vmx_guest_mode == VMX_GUEST_OFF)
+        return cpu->guest.seg.cs.base + (cpu->guest.core.rip & 0xFFFF);
+    return cpu->guest.core.rip;
+}
+
+static uint64_t guest_code_start(void)
+{
+    return vmx_guest_mode == VMX_GUEST_OFF ? 0x11100 : 0x401100;
+}
+
+/* What the cpu executes next, in whichever mode it is: breakpoints match against it. */
+static uint64_t cpu_pc(const fake_cpu *cpu)
+{
+    return vmx_enabled && cpu->in_guest ? guest_pc(cpu) : cpu->core.rip;
+}
+
+static void vm_exit(fake_cpu *cpu, uint32_t reason, uint32_t len)
+{
+    cpu->vmx.exit_reason = reason;
+    cpu->vmx.exit_qualification = 0;
+    cpu->exit_len = len;
+    cpu->in_guest = 0;
+    cpu->vmx.flags &= ~EM_VMX_F_NON_ROOT;
+    cpu->core.rip = cpu->vmx.host_rip;
+    cpu->core.rsp = cpu->vmx.host_rsp;
+}
+
+/* The host handler's vmresume: skips the vmcall, like a hypervisor emulating it. */
+static void vm_resume(fake_cpu *cpu)
+{
+    if (cpu->vmx.exit_reason == VMX_EXIT_VMCALL)
+        cpu->guest.core.rip += cpu->exit_len;
+    cpu->in_guest = 1;
+    cpu->vmx.flags |= EM_VMX_F_NON_ROOT;
+    cpu->core.rip = cpu->vmx.host_rip;
+}
+
+/* One guest instruction of the loop at guest_code_start(). Returns -1, or a vector. */
+static int exec_guest(fake_cpu *cpu)
+{
+    em_x86_core *core;
+    uint64_t     offset;
+
+    core = &cpu->guest.core;
+    offset = guest_pc(cpu) - guest_code_start();
+    if (offset < sizeof guest_code && ram[VMX_GUEST_HPA + 0x11100 + offset] == 0xCC) {
+        core->rip += 1;                       /* int3 traps after the instruction */
+        return 3;
+    }
+    switch (offset) {
+    case 0:
+        core->rax = 0;
+        core->rip += 3;
+        break;
+    case 3:
+        core->rax++;
+        core->rip += 3;
+        break;
+    case 6:
+        vm_exit(cpu, VMX_EXIT_VMCALL, 3);
+        break;
+    case 9:
+        core->rip -= 9;
+        break;
+    default:
+        return 6;
+    }
+    return -1;
+}
+
+static int vmx_mode_by_name(const char *name)
+{
+    int mode;
+
+    for (mode = 0; mode < (int)(sizeof vmx_guest_names / sizeof vmx_guest_names[0]); mode++)
+        if (!strcmp(vmx_guest_names[mode], name))
+            return mode;
+    return -1;
+}
+
+/* "vmx", "vmx guest off|32|pae|4|5", "vmx root|nonroot", "vmx ept on|off" */
+static int vmx_monitor(const char *cmd, char *out, uint32_t cap)
+{
+    char word[16];
+    char value[16];
+    int  mode;
+    int  count;
+
+    word[0] = value[0] = '\0';
+    count = sscanf(cmd, "vmx %15s %15s", word, value);
+    if (!vmx_enabled)
+        return snprintf(out, cap, "VMX is off (start fake_target with --vmx)\n");
+    if (count >= 2 && !strcmp(word, "guest")) {
+        mode = vmx_mode_by_name(value);
+        if (mode < 0)
+            return snprintf(out, cap, "vmx guest off|32|pae|4|5\n");
+        vmx_guest_mode = mode;
+    } else if (count == 1 && !strcmp(word, "root")) {
+        set_in_guest(0);
+    } else if (count == 1 && !strcmp(word, "nonroot")) {
+        set_in_guest(1);
+    } else if (count >= 2 && !strcmp(word, "ept")) {
+        vmx_ept = !strcmp(value, "on");
+    } else if (count > 0) {
+        return snprintf(out, cap, "vmx [guest off|32|pae|4|5 | root | nonroot | ept on|off]\n");
+    }
+    fill_all_vmx();
+    return snprintf(out, cap, "vmx: %s, guest paging %s, EPT %s\n",
+                    cpus[0].in_guest ? "non-root" : "root", vmx_guest_names[vmx_guest_mode],
+                    vmx_ept ? "on" : "off");
 }
 
 static int exec_one(fake_cpu *cpu);
@@ -226,12 +639,17 @@ static void reset_machine(void)
     put_pte(0x3000 + 2 * 8, 0x4000 | 3);
     for (i = 0; i < VA_SIZE / 0x1000; i++)
         put_pte(0x4000 + i * 8, (PA_BASE + i * 0x1000) | 3);
+    put_image();
     memcpy(va_ptr(0x401000, sizeof program), program, sizeof program);
     memcpy(va_ptr(DATA_ADDR, 4), "\x01\x02\x03\x04", 4);
 
     memset(cpus, 0, sizeof cpus);
     for (i = 0; i < cpu_count; i++)
         reset_cpu(&cpus[i], STACK_TOP - i * CPU_STACK);
+    if (vmx_enabled) {
+        build_vmx_tables();
+        fill_all_vmx();
+    }
 
     memset(bps, 0, sizeof bps);
     executed = 0;
@@ -256,6 +674,8 @@ static int exec_one(fake_cpu *cpu)
     uint32_t eax = (uint32_t)cpu->core.rax;
     uint8_t *data;
 
+    if (vmx_enabled && cpu->in_guest)
+        return exec_guest(cpu);
     if (!code)
         return 14;                            /* #PF: outside the mapped window */
     if (*code == 0xCC) {
@@ -280,6 +700,8 @@ static int exec_one(fake_cpu *cpu)
     case 0x401015: cpu->core.rip = (cpu->core.rflags & FLAG_ZF) ? 0x401017 : 0x401008; break;
     case 0x401017:
     case 0x401039:
+    case 0x40105B:
+    case 0x40106F:
         cpu->core.rip = read64(cpu->core.rsp);
         cpu->core.rsp += 8;
         break;
@@ -298,6 +720,29 @@ static int exec_one(fake_cpu *cpu)
         cpu->core.rip = 0x401020;
         break;
     case 0x401045: cpu->core.rip = 0x401040; break;
+    case 0x401050: set_zf(cpu, (uint32_t)cpu->core.rsi == 0); cpu->core.rip = 0x401052; break;
+    case 0x401052: cpu->core.rip = (cpu->core.rflags & FLAG_ZF) ? 0x40105B : 0x401054; break;
+    case 0x401054: cpu->core.rsi = (uint32_t)(cpu->core.rsi - 1); cpu->core.rip = 0x401056; break;
+    case 0x401056:
+        cpu->core.rsp -= 8;
+        write64(cpu->core.rsp, 0x40105B);
+        cpu->core.rip = 0x401050;
+        break;
+    case 0x401060: write64(cpu->core.rsp + 8, cpu->core.rcx); cpu->core.rip = 0x401065; break;
+    case 0x401065:
+        cpu->core.rsp -= 8;
+        write64(cpu->core.rsp, cpu->core.rbx);
+        cpu->core.rip = 0x401066;
+        break;
+    case 0x401066: cpu->core.rbx = 0x1234; cpu->core.rip = 0x40106D; break;
+    case 0x40106D: cpu->core.rip = 0x40106E; break;
+    case 0x401080: cpu->core.rip = 0x401081; break;
+    case 0x401081: vm_resume(cpu); break;
+    case 0x40106E:
+        cpu->core.rbx = read64(cpu->core.rsp);
+        cpu->core.rsp += 8;
+        cpu->core.rip = 0x40106F;
+        break;
     default:
         return 6;                             /* #UD: not an instruction we know */
     }
@@ -378,10 +823,33 @@ static void *block(uint16_t cpu, uint32_t id, uint32_t *size)
 {
     if (cpu >= cpu_count)
         return NULL;
+    if (vmx_enabled && cpus[cpu].in_guest) {
+        switch (id) {
+        case EM_RB_X86_CORE:
+            *size = sizeof cpus[cpu].guest.core;
+            return &cpus[cpu].guest.core;
+        case EM_RB_X86_SEG:
+            *size = sizeof cpus[cpu].guest.seg;
+            return &cpus[cpu].guest.seg;
+        case EM_RB_X86_CTRL:
+            *size = sizeof cpus[cpu].guest_ctrl;
+            return &cpus[cpu].guest_ctrl;
+        }
+    }
     switch (id) {
     case EM_RB_X86_CORE: *size = sizeof cpus[cpu].core; return &cpus[cpu].core;
     case EM_RB_X86_SEG:  *size = sizeof cpus[cpu].segs; return &cpus[cpu].segs;
     case EM_RB_X86_CTRL: *size = sizeof cpus[cpu].ctrl; return &cpus[cpu].ctrl;
+    case EM_RB_X86_VMX:
+        if (!vmx_enabled)
+            return NULL;
+        *size = sizeof cpus[cpu].vmx;
+        return &cpus[cpu].vmx;
+    case EM_RB_X86_GUEST:
+        if (!vmx_enabled)
+            return NULL;
+        *size = sizeof cpus[cpu].guest;
+        return &cpus[cpu].guest;
     }
     return NULL;
 }
@@ -449,6 +917,7 @@ static uint32_t op_monitor(void *user, const char *cmd, uint32_t cmd_len, char *
 {
     uint16_t cpu;
     int      n;
+    char     line[64];
 
     (void)user;
     if (cmd_len == 4 && !memcmp(cmd, "info", 4)) {
@@ -460,8 +929,14 @@ static uint32_t op_monitor(void *user, const char *cmd, uint32_t cmd_len, char *
     } else if (cmd_len == 5 && !memcmp(cmd, "reset", 5)) {
         reset_machine();
         n = snprintf(out, cap, "machine reset\n");
+    } else if (cmd_len >= 3 && !memcmp(cmd, "vmx", 3) && (cmd_len == 3 || cmd[3] == ' ')) {
+        if (cmd_len >= sizeof line)
+            cmd_len = sizeof line - 1;
+        memcpy(line, cmd, cmd_len);
+        line[cmd_len] = '\0';
+        n = vmx_monitor(line, out, cap);
     } else
-        n = snprintf(out, cap, "monitor commands: info, reset\n");
+        n = snprintf(out, cap, "monitor commands: info, reset, vmx\n");
     return n < 0 ? 0 : ((uint32_t)n < cap ? (uint32_t)n : cap);
 }
 
@@ -625,7 +1100,7 @@ static int run_one(fake_cpu *cpu, uint16_t index, em_stop_reason *reason, uint32
 {
     int vec;
 
-    if (!cpu->skip_bp && (*bp_id = bp_at(cpu->core.rip, index)) != 0) {
+    if (!cpu->skip_bp && (*bp_id = bp_at(cpu_pc(cpu), index)) != 0) {
         *reason = EM_STOP_BREAKPOINT;
         *addr = 0;
         return 1;
@@ -796,6 +1271,8 @@ int main(int argc, char **argv)
             held_access = 0;
         else if (!strcmp(argv[arg], "--halted") && arg + 1 < argc)
             halted_cpu = atoi(argv[++arg]);
+        else if (!strcmp(argv[arg], "--vmx"))
+            vmx_enabled = 1;
         else
             port = (unsigned)atoi(argv[arg]);
     }
@@ -826,6 +1303,8 @@ int main(int argc, char **argv)
     info.cpu_count = cpu_count;
     info.regblocks = EM_RB_BIT(EM_RB_X86_CORE) | EM_RB_BIT(EM_RB_X86_SEG) |
                      EM_RB_BIT(EM_RB_X86_CTRL);
+    if (vmx_enabled)
+        info.regblocks |= EM_RB_BIT(EM_RB_X86_VMX) | EM_RB_BIT(EM_RB_X86_GUEST);
     info.features = (run_sets ? EM_FEAT_RUN_SET : 0) | (held_access ? EM_FEAT_HELD_ACCESS : 0) |
                     EM_FEAT_CONTINUE_STEP;
 

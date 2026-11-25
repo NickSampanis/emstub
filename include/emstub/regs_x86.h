@@ -10,6 +10,7 @@ typedef enum em_regblock {
     EM_RB_X86_SYS  = 3,
     EM_RB_X86_FPU  = 4,
     EM_RB_X86_VMX  = 5,
+    EM_RB_X86_GUEST = 6,
 } em_regblock;
 
 #define EM_RB_BIT(block_id)  (1u << (block_id))
@@ -82,14 +83,68 @@ typedef struct em_x86_fpu {
 } em_x86_fpu;
 EM_STATIC_ASSERT(sizeof(em_x86_fpu) == 512, "em_x86_fpu layout");
 
+/* VMX state of a cpu. valid says which groups the stub could fill (EM_VMX_V_*); the
+ * others read as zero. The guest and host fields are the current VMCS's. */
 typedef struct em_x86_vmx {
-    uint64_t    host_cr0, host_cr3, host_cr4, host_rsp, host_rip, host_ept;
-    uint64_t    guest_cr0, guest_cr3, guest_cr4, guest_rsp, guest_rip, guest_efer;
-    em_x86_core host_saved;
-    em_x86_core guest_saved;
-    uint8_t     vmx_enabled, vmx_in_guest, reserved[6];
+    uint32_t valid;
+    uint32_t flags;                 /* EM_VMX_F_* */
+    uint64_t vmxon_pa;
+    uint64_t vmcs_pa;               /* current VMCS, ~0 = none */
+
+    uint64_t eptp;
+    uint16_t vpid;
+    uint16_t reserved0[3];
+    uint64_t proc_ctls, proc_ctls2, exit_ctls, entry_ctls;
+
+    uint64_t guest_cr0, guest_cr3, guest_cr4, guest_efer, guest_pat;
+    uint64_t guest_pdpte[4];        /* PAE guest with EPT: loaded from the VMCS, not memory */
+
+    uint64_t host_cr0, host_cr3, host_cr4, host_efer;
+    uint64_t host_rip, host_rsp;
+
+    uint32_t exit_reason;           /* last VM exit */
+    uint32_t reserved1;
+    uint64_t exit_qualification;
+    uint64_t guest_linear_addr;
+    uint64_t guest_physical_addr;
 } em_x86_vmx;
-EM_STATIC_ASSERT(sizeof(em_x86_vmx) == 392, "em_x86_vmx layout");
+EM_STATIC_ASSERT(sizeof(em_x86_vmx) == 224, "em_x86_vmx layout");
+
+#define EM_VMX_V_STATE       (1u << 0)   /* flags, vmxon_pa, vmcs_pa */
+#define EM_VMX_V_CTLS        (1u << 1)   /* eptp, vpid, the execution / exit / entry controls */
+#define EM_VMX_V_GUEST       (1u << 2)   /* guest_cr0 ... guest_pdpte */
+#define EM_VMX_V_HOST        (1u << 3)   /* host_* */
+#define EM_VMX_V_EXIT        (1u << 4)   /* exit_reason ... guest_physical_addr */
+
+#define EM_VMX_F_ON          (1u << 0)   /* VMXON executed */
+#define EM_VMX_F_NON_ROOT    (1u << 1)   /* stopped in the guest */
+#define EM_VMX_F_VMCS        (1u << 2)   /* a current VMCS is loaded */
+#define EM_VMX_F_EPT         (1u << 3)   /* EPT enabled in the current VMCS */
+#define EM_VMX_F_VPID        (1u << 4)
+#define EM_VMX_F_UG          (1u << 5)   /* unrestricted guest */
+
+/* Controls the debugger looks at. */
+#define EM_VMX_PROC2_EPT     (1ull << 1)
+#define EM_VMX_PROC2_VPID    (1ull << 5)
+#define EM_VMX_PROC2_UG      (1ull << 7)
+#define EM_VMX_PROC2_MBEC    (1ull << 22)  /* mode-based execute control for EPT */
+#define EM_VMX_EXIT_HOST_64  (1ull << 9)   /* host address-space size */
+#define EM_VMX_ENTRY_IA32E   (1ull << 9)   /* IA-32e mode guest */
+
+/* Registers of the current VMCS's guest. In non-root mode they are the cpu's own; in root
+ * mode rip / rsp / rflags and the segments come from the VMCS guest-state area and the
+ * GPRs from wherever the hypervisor saved them on the VM exit. */
+typedef struct em_x86_guest {
+    uint32_t    valid;              /* EM_GUEST_V_* */
+    uint32_t    reserved;
+    em_x86_core core;
+    em_x86_segs seg;
+} em_x86_guest;
+EM_STATIC_ASSERT(sizeof(em_x86_guest) == 312, "em_x86_guest layout");
+
+#define EM_GUEST_V_GPRS      (1u << 0)   /* rax ... r15 except rsp */
+#define EM_GUEST_V_RIP       (1u << 1)   /* rip, rsp, rflags */
+#define EM_GUEST_V_SEGS      (1u << 2)
 
 #define EM_X86_RB_MAX 512u
 
@@ -108,6 +163,8 @@ static inline uint32_t em_x86_rb_size(uint32_t id)
             return (uint32_t)sizeof(em_x86_fpu);
         case EM_RB_X86_VMX:
             return (uint32_t)sizeof(em_x86_vmx);
+        case EM_RB_X86_GUEST:
+            return (uint32_t)sizeof(em_x86_guest);
     }
     return 0;
 }
@@ -119,6 +176,7 @@ typedef struct em_x86_regs {
     em_x86_sys  sys;
     em_x86_fpu  fpu;
     em_x86_vmx  vmx;
+    em_x86_guest guest;
     uint32_t    valid;
     uint32_t    reserved;
 } em_x86_regs;
