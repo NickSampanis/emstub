@@ -1146,15 +1146,71 @@ static uint16_t first_running(em_stub *s)
     return 0;
 }
 
+/* Cpu 0 wakes the --halted cpu HALT_WAKE_MS after it first runs. */
+static void wake_halted(void)
+{
+    if (halted_cpu < 0 || !cpus[halted_cpu].halted)
+        return;
+    if (!wake_at)
+        wake_at = now_ms() + HALT_WAKE_MS;
+    else if (now_ms() >= wake_at)
+        cpus[halted_cpu].halted = 0;
+}
+
+/* Breakpoints and stops a debugger left behind: on detach, and from a lost session when the
+ * next debugger attaches. */
+static void forget_debugger(void)
+{
+    uint16_t index;
+
+    memset(bps, 0, sizeof bps);
+    for (index = 0; index < cpu_count; index++) {
+        cpus[index].pending = 0;
+        cpus[index].skip_bp = 0;
+    }
+}
+
+/* With no debugger after a detach every cpu runs, and exceptions go to the guest. */
+static void run_detached(void)
+{
+    uint16_t index;
+    int      i;
+
+    for (i = 0; i < 1000; i++) {
+        for (index = 0; index < cpu_count; index++) {
+            if (cpus[index].halted)
+                continue;
+            if (index == 0)
+                wake_halted();
+            exec_one(&cpus[index]);
+        }
+    }
+}
+
+/* Whether a debugger is waiting to connect, after at most ms. */
+static int accept_ready(sock_t server, unsigned ms)
+{
+    fd_set         readable;
+    struct timeval timeout;
+
+    FD_ZERO(&readable);
+    FD_SET(server, &readable);
+    timeout.tv_sec = (long)(ms / 1000u);
+    timeout.tv_usec = (long)(ms % 1000u) * 1000L;
+    return select((int)server + 1, &readable, NULL, NULL, &timeout) > 0;
+}
+
 /* Run the machine for one debugger connection. Starts stopped (EM_STOP_ATTACH).
  * All-stop: a continue runs the cpus the debugger named (all of them by default), one
  * instruction each in turn, until one of them stops; a step runs only the requested cpu,
  * and a continue that steps a cpu stops after that cpu's next instruction.
  * The round in which a cpu stops is finished, like cores running in parallel: a second
- * cpu that stops in it keeps its stop pending for a later resume. */
-static void run_session(em_stub *s)
+ * cpu that stops in it keeps its stop pending for a later resume.
+ * Returns 1 if the debugger detached; a lost connection returns 0 with the machine stopped. */
+static int run_session(em_stub *s)
 {
     em_resume      r;
+    em_run         run;
     em_stop_reason reason = EM_STOP_ATTACH;
     em_stop_reason other_reason;
     fake_cpu      *cpu;
@@ -1172,7 +1228,9 @@ static void run_session(em_stub *s)
         if (stopped) {
             r = em_stub_stopped(s, stop_cpu, reason, bp_id, addr);
             if (r.action == EM_RESUME_DETACH)
-                return;
+                return 1;
+            if (r.action == EM_RESUME_DISCONNECTED)
+                return 0;
             stopped = 0;
             stepping = -1;
             bp_id = 0;
@@ -1204,12 +1262,8 @@ static void run_session(em_stub *s)
                 cpu = &cpus[index];
                 if (cpu->halted)
                     continue;
-                if (index == 0 && halted_cpu >= 0 && cpus[halted_cpu].halted) {
-                    if (!wake_at)
-                        wake_at = now_ms() + HALT_WAKE_MS;
-                    else if (now_ms() >= wake_at)
-                        cpus[halted_cpu].halted = 0;
-                }
+                if (index == 0)
+                    wake_halted();
                 if (!stopped && (int)index == stepping) {
                     vec = exec_one(cpu);
                     stopped = 1;
@@ -1233,14 +1287,15 @@ static void run_session(em_stub *s)
         }
         if (stopped)
             continue;
-        if (em_stub_poll(s) == EM_RUN_STOP) {
+        run = em_stub_poll(s);
+        if (run == EM_RUN_DETACH)
+            return 1;
+        if (run == EM_RUN_STOP) {
             stopped = 1;
             stop_cpu = first_running(s);
             reason = EM_STOP_PAUSE;
             continue;
         }
-        if (!em_stub_connected(s))
-            return;
         sleep_ms(1);
     }
 }
@@ -1254,6 +1309,7 @@ int main(int argc, char **argv)
     unsigned           port = 4242u;
     int                one = 1;
     int                arg;
+    int                detached = 0;
 #ifdef _WIN32
     WSADATA            wsa;
 #endif
@@ -1311,7 +1367,14 @@ int main(int argc, char **argv)
     printf("fake_target listening on 127.0.0.1:%u (%u cpu%s)\n", port, cpu_count,
            cpu_count == 1 ? "" : "s");
     fflush(stdout);
+    /* Like QEMU, the machine outlives connections: a lost debugger leaves it stopped for the
+     * next one, and only a detach lets it run on its own. */
+    reset_machine();
     for (;;) {
+        if (detached && !accept_ready(server, 1)) {
+            run_detached();
+            continue;
+        }
         client = accept(server, NULL, NULL);
         if (client == INVALID_SOCKET)
             continue;
@@ -1319,13 +1382,16 @@ int main(int argc, char **argv)
         printf("debugger connected\n");
         fflush(stdout);
 
-        reset_machine();
+        forget_debugger();
         em_stub_init(&stub, &ops, &client, &info);
         em_stub_reset(&stub, 0);
-        run_session(&stub);
+        detached = run_session(&stub);
+        if (detached)
+            forget_debugger();
 
         closesocket(client);
-        printf("debugger disconnected\n");
+        printf(detached ? "debugger detached, machine running\n"
+                        : "debugger disconnected, machine stopped\n");
         fflush(stdout);
     }
 }

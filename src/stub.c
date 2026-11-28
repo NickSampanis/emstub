@@ -37,6 +37,8 @@ static void drop_connection(em_stub *stub)
 {
     stub->connected = 0;
     stub->rx_have = 0;
+    if (stub->running)
+        stub->pause_req = 1;
 }
 
 static uint32_t tx_cap(const em_stub *stub)
@@ -543,6 +545,16 @@ static em_status h_PAUSE(em_stub *stub, const uint8_t *req, uint32_t len)
     return EM_OK;
 }
 
+static em_status h_DETACH(em_stub *stub, const uint8_t *req, uint32_t len)
+{
+    (void)req;
+    (void)len;
+    stub->detached = 1;
+    stub->run_all = 1;
+    set_resume(stub, EM_RESUME_DETACH, 0);
+    return EM_OK;
+}
+
 static em_status h_BP_SET(em_stub *stub, const uint8_t *req, uint32_t len)
 {
     em_bp_req            bp_req;
@@ -746,6 +758,7 @@ static void compute_commands(em_stub *stub)
     set_command(stub, EM_CMD_CONTINUE);
     set_command(stub, EM_CMD_STEP);
     set_command(stub, EM_CMD_PAUSE);
+    set_command(stub, EM_CMD_DETACH);
     if (ops->translate || (stub->info.regblocks & EM_RB_BIT(EM_RB_X86_CTRL)))
         set_command(stub, EM_CMD_TRANSLATE);
     if (ops->bp_set && ops->bp_clear) {
@@ -887,6 +900,7 @@ void em_stub_reset(em_stub *stub, int running)
     stub->pause_req    = 0;
     stub->in_handler   = 0;
     stub->resume_set   = 0;
+    stub->detached     = 0;
     stub->run_all      = 1;
     stub->rx_have      = 0;
     stub->peer_max     = EM_MIN_PAYLOAD;
@@ -899,9 +913,10 @@ int em_stub_connected(const em_stub *stub)
 
 em_run em_stub_poll(em_stub *stub)
 {
-    if (!stub->connected)
-        return EM_RUN_CONTINUE;
-    service(stub);
+    if (stub->connected)
+        service(stub);
+    if (stub->detached)
+        return EM_RUN_DETACH;
     if (stub->pause_req) {
         stub->pause_req = 0;
         return EM_RUN_STOP;
@@ -912,12 +927,15 @@ em_run em_stub_poll(em_stub *stub)
 em_resume em_stub_stopped(em_stub *stub, uint16_t cpu, em_stop_reason reason, uint32_t bp_id,
                           uint64_t addr)
 {
-    em_resume            detach_resume;
+    em_resume            end_resume;
 
-    detach_resume.action = EM_RESUME_DETACH;
-    detach_resume.cpu = cpu;
+    end_resume.action = EM_RESUME_DETACH;
+    end_resume.cpu = cpu;
+    if (stub->detached)
+        return end_resume;
+    end_resume.action = EM_RESUME_DISCONNECTED;
     if (!stub->connected)
-        return detach_resume;
+        return end_resume;
 
     stub->running    = 0;
     stub->pause_req  = 0;
@@ -928,10 +946,12 @@ em_resume em_stub_stopped(em_stub *stub, uint16_t cpu, em_stop_reason reason, ui
         if (recv_packet(stub, 1) > 0)
             handle_packet(stub);
     }
-    if (!stub->connected)
-        return detach_resume;
+    if (!stub->resume_set)
+        return end_resume;
 
     stub->running = 1;
+    if (!stub->connected)
+        stub->pause_req = 1;
     return stub->resume;
 }
 

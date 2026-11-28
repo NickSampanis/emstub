@@ -234,7 +234,8 @@ EM_STATIC_ASSERT(sizeof(em_stopped) == 16, "em_stopped layout");
     X(SNAP_LOAD,   0x0F, em_snap_hdr,       em_empty,          EM_F_REQ_TAIL)                    \
     X(MONITOR,     0x10, em_empty,          em_empty,          EM_F_REQ_TAIL | EM_F_REP_TAIL)    \
     X(SNAP_LIST,   0x11, em_empty,          em_empty,          EM_F_REP_TAIL | EM_F_RUNNING)     \
-    X(SNAP_DELETE, 0x12, em_snap_hdr,       em_empty,          EM_F_REQ_TAIL | EM_F_RUNNING)
+    X(SNAP_DELETE, 0x12, em_snap_hdr,       em_empty,          EM_F_REQ_TAIL | EM_F_RUNNING)     \
+    X(DETACH,      0x13, em_empty,          em_empty,          EM_F_RUNNING)
 
 #define EM_EVENTS(X)                                                                             \
     X(STOPPED,    0x81, em_stopped,      EM_F_REP_TAIL)                                          \

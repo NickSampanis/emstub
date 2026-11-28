@@ -321,12 +321,38 @@ int main(void)
     h = next(NULL);
     CHECK(h.type == EM_CMD_CONTINUE && h.status == EM_OK);
 
-    /* Corrupted packet drops the connection; stopped() then detaches. */
+    /* A corrupted packet drops the connection while running: the poll asks for a stop once,
+     * and the stop reports the disconnect so the target stays stopped. */
     request(EM_CMD_HELLO, &hello, sizeof hello, 0, 0);
     to_stub[to_stub_len - 1] ^= 0xFF;
-    em_stub_poll(&s);
+    CHECK(em_stub_poll(&s) == EM_RUN_STOP);
     CHECK(!em_stub_connected(&s));
-    CHECK(em_stub_stopped(&s, 0, EM_STOP_PAUSE, 0, 0).action == EM_RESUME_DETACH);
+    CHECK(em_stub_poll(&s) == EM_RUN_CONTINUE);
+    CHECK(em_stub_stopped(&s, 0, EM_STOP_PAUSE, 0, 0).action == EM_RESUME_DISCONNECTED);
+
+    /* Lost while stopped: stopped() reports the disconnect. */
+    em_stub_reset(&s, 0);
+    r = em_stub_stopped(&s, 0, EM_STOP_ATTACH, 0, 0);
+    CHECK(r.action == EM_RESUME_DISCONNECTED);
+    next(NULL);                               /* STOPPED */
+
+    /* DETACH while stopped resumes with EM_RESUME_DETACH, and every later stop passes. */
+    em_stub_reset(&s, 0);
+    request(EM_CMD_DETACH, &empty, sizeof empty, 0, 0);
+    r = em_stub_stopped(&s, 0, EM_STOP_ATTACH, 0, 0);
+    CHECK(r.action == EM_RESUME_DETACH);
+    next(NULL);                               /* STOPPED */
+    h = next(NULL);
+    CHECK(h.type == EM_CMD_DETACH && h.status == EM_OK);
+    CHECK(em_stub_poll(&s) == EM_RUN_DETACH);
+    CHECK(em_stub_stopped(&s, 0, EM_STOP_BREAKPOINT, 1, 0).action == EM_RESUME_DETACH);
+
+    /* DETACH while running: the poll reports it. */
+    em_stub_reset(&s, 1);
+    request(EM_CMD_DETACH, &empty, sizeof empty, 0, 0);
+    CHECK(em_stub_poll(&s) == EM_RUN_DETACH);
+    h = next(NULL);
+    CHECK(h.type == EM_CMD_DETACH && h.status == EM_OK);
 
     printf("%s (%d failures)\n", failures ? "FAILED" : "ALL PASSED", failures);
     return failures != 0;

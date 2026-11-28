@@ -63,16 +63,20 @@ typedef struct em_stub_info {
     uint64_t    features;
 } em_stub_info;
 
+/* em_stub_poll while the target runs. A lost connection asks for a stop (EM_RUN_STOP): the
+ * stop's em_stub_stopped then returns EM_RESUME_DISCONNECTED. */
 typedef enum em_run {
     EM_RUN_CONTINUE = 0,
     EM_RUN_STOP     = 1,
+    EM_RUN_DETACH   = 2,           /* the debugger detached: drop its breakpoints, keep running */
 } em_run;
 
 typedef enum em_resume_action {
     EM_RESUME_CONTINUE      = 0,
     EM_RESUME_STEP          = 1,
-    EM_RESUME_DETACH        = 2,
+    EM_RESUME_DETACH        = 2,   /* the debugger detached: drop its breakpoints, run all cpus */
     EM_RESUME_CONTINUE_STEP = 3,   /* continue, single-stepping em_resume.cpu */
+    EM_RESUME_DISCONNECTED  = 4,   /* connection lost: stay stopped until a debugger attaches */
 } em_resume_action;
 
 typedef struct em_resume {
@@ -93,6 +97,7 @@ typedef struct em_stub {
     uint8_t            in_handler;
 
     uint8_t            resume_set;
+    uint8_t            detached;
     em_resume          resume;
     uint8_t            run_all;
     uint8_t            run_set[EM_STUB_MAX_CPUS / 8];
